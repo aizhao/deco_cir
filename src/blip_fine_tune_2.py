@@ -86,13 +86,30 @@ def clip_finetune_fiq(train_dress_types: List[str], val_dress_types: List[str],
                                        num_workers=kwargs['num_workers'], pin_memory=False, collate_fn=collate_fn,
                                        drop_last=True, shuffle=True)
 
-    # Define the optimizer, the loss and the grad scaler
-    optimizer = optim.AdamW(
-        [{'params': filter(lambda p: p.requires_grad, blip_model.parameters()), 'lr': learning_rate,
-        #   'betas': (0.9, 0.999), 'eps': 1e-7, 'weight_decay':0.05}])
-        'betas': (0.9, 0.98), 'eps': 1e-7, 'weight_decay':0.05}])
-    # scheduler = OneCycleLR(optimizer, max_lr=learning_rate, pct_start=1/50, steps_per_epoch=len(relative_train_loader), epochs=80)
-    scheduler = OneCycleLR(optimizer, max_lr=learning_rate, pct_start=1.5/num_epochs, div_factor=100., steps_per_epoch=len(relative_train_loader), epochs=num_epochs)
+    # Define the optimizer with differential learning rates
+    # DeCo Projector (randomly initialized) needs 10-20x higher LR than pretrained BERT
+    projector_params = []
+    base_params = []
+    
+    for name, param in blip_model.named_parameters():
+        if not param.requires_grad:
+            continue
+        # DeCo Projector and visual position embeddings need higher LR
+        if 'deco_projector' in name or 'visual_pos_embed' in name:
+            projector_params.append(param)
+        else:
+            base_params.append(param)
+    
+    print(f"Projector params: {len(projector_params)}, Base params: {len(base_params)}")
+    
+    optimizer = optim.AdamW([
+        {'params': base_params, 'lr': learning_rate, 'betas': (0.9, 0.98), 'eps': 1e-7, 'weight_decay': 0.05},
+        {'params': projector_params, 'lr': learning_rate * 20, 'betas': (0.9, 0.98), 'eps': 1e-7, 'weight_decay': 0.05}
+    ])
+    
+    scheduler = OneCycleLR(optimizer, max_lr=[learning_rate, learning_rate * 20], 
+                          pct_start=1.5/num_epochs, div_factor=100., 
+                          steps_per_epoch=len(relative_train_loader), epochs=num_epochs)
 
     scaler = torch.cuda.amp.GradScaler()
 
@@ -107,7 +124,21 @@ def clip_finetune_fiq(train_dress_types: List[str], val_dress_types: List[str],
 
     # Start with the training loop
     print('Training loop started')
+    warmup_epochs = 1  # First epoch: freeze BERT, only train DeCo Projector
+    
     for epoch in range(num_epochs):
+        # Warmup strategy: freeze BERT in first epoch to let DeCo Projector adapt
+        if epoch < warmup_epochs:
+            print(f"[Warmup Epoch {epoch}] Freezing BERT, only training DeCo Projector")
+            for name, param in blip_model.named_parameters():
+                if 'Qformer' in name and 'deco_projector' not in name:
+                    param.requires_grad = False
+        elif epoch == warmup_epochs:
+            print(f"[Epoch {epoch}] Unfreezing BERT, full model training")
+            for name, param in blip_model.named_parameters():
+                if 'Qformer' in name:
+                    param.requires_grad = True
+        
         train_running_results = {'images_in_epoch': 0}
         train_bar = tqdm(relative_train_loader, ncols=150)
         for idx, (reference_images, target_images, captions) in enumerate(train_bar):
@@ -128,8 +159,15 @@ def clip_finetune_fiq(train_dress_types: List[str], val_dress_types: List[str],
             with torch.cuda.amp.autocast():
                 loss_dict = blip_model({"image":reference_images, "target":target_images, "text_input":captions})
                 loss = 0.
+                
+                # Adaptive loss weighting: reduce TIC loss in early epochs
+                tic_weight = 0.01 if epoch < 5 else 1.0
+                
                 for key in loss_dict.keys():
-                    loss += loss_dict[key]
+                    if key == 'loss_tic':
+                        loss += tic_weight * loss_dict[key]
+                    else:
+                        loss += loss_dict[key]
 
             # Backpropagate and update the weights
             scaler.scale(loss).backward()
@@ -253,11 +291,30 @@ def clip_finetune_cirr(num_epochs: int, blip_model_name: str, backbone: str, lea
                                        num_workers=kwargs['num_workers'], pin_memory=False, collate_fn=collate_fn,
                                        drop_last=True, shuffle=True)
 
-    # Define the optimizer, the loss and the grad scaler
-    optimizer = optim.AdamW(
-        [{'params': filter(lambda p: p.requires_grad, blip_model.parameters()), 'lr': learning_rate,
-          'betas': (0.9, 0.98), 'eps': 1e-7, 'weight_decay':0.05}])
-    scheduler = OneCycleLR(optimizer, max_lr=learning_rate, pct_start=1/50, steps_per_epoch=len(relative_train_loader), epochs=80)
+    # Define the optimizer with differential learning rates
+    # DeCo Projector (randomly initialized) needs 10-20x higher LR than pretrained BERT
+    projector_params = []
+    base_params = []
+    
+    for name, param in blip_model.named_parameters():
+        if not param.requires_grad:
+            continue
+        # DeCo Projector and visual position embeddings need higher LR
+        if 'deco_projector' in name or 'visual_pos_embed' in name:
+            projector_params.append(param)
+        else:
+            base_params.append(param)
+    
+    print(f"Projector params: {len(projector_params)}, Base params: {len(base_params)}")
+    
+    optimizer = optim.AdamW([
+        {'params': base_params, 'lr': learning_rate, 'betas': (0.9, 0.98), 'eps': 1e-7, 'weight_decay': 0.05},
+        {'params': projector_params, 'lr': learning_rate * 20, 'betas': (0.9, 0.98), 'eps': 1e-7, 'weight_decay': 0.05}
+    ])
+    
+    scheduler = OneCycleLR(optimizer, max_lr=[learning_rate, learning_rate * 20], 
+                          pct_start=1/50, 
+                          steps_per_epoch=len(relative_train_loader), epochs=80)
 
     scaler = torch.cuda.amp.GradScaler()
 
@@ -275,7 +332,21 @@ def clip_finetune_cirr(num_epochs: int, blip_model_name: str, backbone: str, lea
     # # 
     # results = compute_cirr_val_metrics(relative_val_dataset, blip_model, val_index_features,
     #                                     val_index_names, txt_processors)
+    warmup_epochs = 1  # First epoch: freeze BERT, only train DeCo Projector
+    
     for epoch in range(num_epochs):
+        # Warmup strategy: freeze BERT in first epoch to let DeCo Projector adapt
+        if epoch < warmup_epochs:
+            print(f"[Warmup Epoch {epoch}] Freezing BERT, only training DeCo Projector")
+            for name, param in blip_model.named_parameters():
+                if 'Qformer' in name and 'deco_projector' not in name:
+                    param.requires_grad = False
+        elif epoch == warmup_epochs:
+            print(f"[Epoch {epoch}] Unfreezing BERT, full model training")
+            for name, param in blip_model.named_parameters():
+                if 'Qformer' in name:
+                    param.requires_grad = True
+        
         train_running_results = {'images_in_epoch': 0}
         train_bar = tqdm(relative_train_loader, ncols=150)
         for idx, (reference_images, target_images, captions) in enumerate(train_bar):
@@ -292,8 +363,14 @@ def clip_finetune_cirr(num_epochs: int, blip_model_name: str, backbone: str, lea
             with torch.cuda.amp.autocast():
                 loss_dict = blip_model({"image":reference_images, "target":target_images, "text_input":captions})
                 loss = 0.
+                
+                # Adaptive loss weighting: reduce TIC loss in early epochs
+                tic_weight = 0.01 if epoch < 5 else kwargs.get('loss_tic', 1.0)
+                
                 for key in loss_dict.keys():
-                    if key != 'loss_itc':
+                    if key == 'loss_tic':
+                        loss += tic_weight * loss_dict[key]
+                    elif key != 'loss_itc':
                         loss += kwargs[key] * loss_dict[key]
                     else:
                         loss += loss_dict[key]
@@ -379,6 +456,8 @@ if __name__ == '__main__':
     parser.add_argument("--loss-align", default=0.4, type=float)
     parser.add_argument("--loss-rtc", default=0.4, type=float)
     parser.add_argument("--loss-itm", default=1, type=float)
+    parser.add_argument("--loss-dense", default=0.5, type=float, help="Weight for dense spatial alignment loss")
+    parser.add_argument("--loss-tic", default=0.3, type=float, help="Weight for textual intra-modal contrastive loss")
     parser.add_argument("--validation-frequency", default=1, type=int, help="Validation frequency expressed in epochs")
     parser.add_argument("--target-ratio", default=1.25, type=float, help="TargetPad target ratio")
     parser.add_argument("--transform", default="targetpad", type=str,
@@ -410,6 +489,8 @@ if __name__ == '__main__':
         "loss_rtc": args.loss_rtc,
         "loss_align": args.loss_align,
         "loss_itm": args.loss_itm,
+        "loss_dense": args.loss_dense,
+        "loss_tic": args.loss_tic,
         "save_memory": args.save_memory
     }
     # set_seed(912)

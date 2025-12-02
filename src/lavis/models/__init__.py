@@ -50,6 +50,7 @@ from lavis.models.blip2_models.blip2_qformer_cir_neg_rel import Blip2QformerCirN
 from lavis.models.blip2_models.blip2_qformer_cir_rerank import Blip2QformerCirRerank
 from lavis.models.blip2_models.blip2_qformer_cir_z_learn_pos_align import Blip2QformerCirZLearnPosAlign
 from lavis.models.blip2_models.blip2_instruct_cir import Blip2InstructCir
+from lavis.models.blip2_models.blip2_avgpool_cir_align_prompt import Blip2AvgPoolCirAlignPrompt
 
 from lavis.models.blip2_models.blip2_t5_instruct import Blip2T5Instruct
 from lavis.models.blip2_models.blip2_vicuna_instruct import Blip2VicunaInstruct
@@ -98,6 +99,7 @@ __all__ = [
     "Blip2QformerCirZLearnPosAlign",
     "Blip2QformerCirAlignPrompt",
     "Blip2QformerCirFull",
+    "Blip2AvgPoolCirAlignPrompt",
     "Blip2Base",
     "Blip2ITM",
     "Blip2OPT",
