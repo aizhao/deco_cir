@@ -1,0 +1,37 @@
+model:
+  arch: sa_qformer
+  load_finetuned: False
+  load_pretrained: False
+  
+  # Vision encoder config
+  vit_model: "eva_clip_g"
+  image_size: 224
+  drop_path_rate: 0
+  use_grad_checkpoint: False
+  vit_precision: "fp16"
+  freeze_vit: True
+  
+  # Q-Former config
+  num_query_token: 32
+  cross_attention_freq: 2
+  
+  # SA-QFormer specific config
+  grid_size: [8, 8]
+  
+  # Projection config
+  embed_dim: 256
+  max_txt_len: 32
+
+preprocess:
+  vis_processor:
+    train:
+      name: "blip_image_train"
+      image_size: 224
+    eval:
+      name: "blip_image_eval"
+      image_size: 224
+  text_processor:
+    train:
+      name: "blip_caption"
+    eval:
+      name: "blip_caption"

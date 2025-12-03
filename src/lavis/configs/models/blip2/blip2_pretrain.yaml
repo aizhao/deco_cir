@@ -19,8 +19,10 @@ model:
 
   # Q-Former
   num_query_token: 32
-
-
+  # grid_size: [4, 8]                # 保证 4*8=32，对齐 num_query_token
+  # use_grid_pooling: true          # 先做 baseline：不启用 DeCo pooling
+  use_instruction_injection: true
+  instruction_alpha: 0.1
 preprocess:
     vis_processor:
         train:

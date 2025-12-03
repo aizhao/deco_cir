@@ -5,6 +5,7 @@
  For full license text, see the LICENSE file in the repo root or https://opensource.org/licenses/BSD-3-Clause
 """
 import logging
+import math
 
 import torch
 import torch.distributed as dist
@@ -20,6 +21,50 @@ from lavis.models.blip2_models.blip2 import (
     disabled_train,
 )
 from lavis.models.blip_models.blip_outputs import BlipOutput, BlipOutputFeatures
+
+
+class AdaptiveGridPooling(nn.Module):
+    """
+    DeCo-style adaptive pooling:
+    - Input: ViT patch embeddings (with or without CLS), shape (B, N, D)
+    - Output: fixed HxW grid, flattened to (B, H*W, D)
+    """
+
+    def __init__(self, output_size=(8, 8)):
+        super().__init__()
+        self.output_size = output_size
+        self.adaptive_pool = nn.AdaptiveAvgPool2d(output_size)
+
+    def forward(self, vit_features):
+        """
+        vit_features: (B, N, D), where N = H*W (+ 1 for CLS)
+        """
+        B, N, D = vit_features.shape
+
+        # Try to infer original spatial grid. First assume CLS at position 0.
+        N_patches = N - 1
+        H_vit = W_vit = int(math.sqrt(N_patches))
+
+        if H_vit * W_vit == N_patches:
+            # Has CLS token, remove it
+            vit_features = vit_features[:, 1:, :]
+            N = N_patches
+        else:
+            # No CLS token, use all tokens
+            H_vit = W_vit = int(math.sqrt(N))
+            if H_vit * W_vit != N:
+                raise ValueError(f"Cannot infer square grid from {N} tokens")
+
+        # (B, N, D) -> (B, D, H, W)
+        features_2d = vit_features.view(B, H_vit, W_vit, D).permute(0, 3, 1, 2)
+        pooled = self.adaptive_pool(features_2d)  # (B, D, H_out, W_out)
+
+        # (B, D, H_out, W_out) -> (B, H_out*W_out, D)
+        pooled = pooled.permute(0, 2, 3, 1)
+        H_out, W_out = self.output_size
+        grid_features = pooled.reshape(B, H_out * W_out, D)
+
+        return grid_features
 
 
 @registry.register_model("blip2_cir_align_prompt")
@@ -53,6 +98,10 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
         cross_attention_freq=2,
         embed_dim=256,
         max_txt_len=32,
+        grid_size=(4, 8),
+        use_grid_pooling=False,
+        use_instruction_injection=False,
+        instruction_alpha=0.1,
     ):
         super().__init__()
 
@@ -67,6 +116,8 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
             self.visual_encoder = self.visual_encoder.eval()
             self.visual_encoder.train = disabled_train
             logging.info("freeze vision encoder")
+
+        # -------- Original Q-Former with 32 unordered query tokens --------
         self.Qformer, self.query_tokens = self.init_Qformer(
             num_query_token, self.visual_encoder.num_features, cross_attention_freq
         )
@@ -85,11 +136,31 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
         self.temp = nn.Parameter(0.07 * torch.ones([]))
 
         self.max_txt_len = max_txt_len
-        # new tokens
+        self.instruction_alpha = instruction_alpha
+
+        # Prompt tokens for relative contrastive branch
         self.prompt_tokens = nn.Parameter(
             torch.zeros(1, num_query_token, self.Qformer.config.hidden_size)
         )
         self.prompt_tokens.data.normal_(mean=0.0, std=self.Qformer.config.initializer_range)
+
+        # DeCo-style adaptive pooling (kept for future experiments, disabled by default)
+        self.adaptive_pooling = AdaptiveGridPooling(output_size=grid_size)
+        self.use_grid_pooling = use_grid_pooling
+        self.use_instruction_injection = use_instruction_injection
+
+        # lightweight instruction MLP: text CLS -> bias on query tokens
+        self.instruction_mlp = nn.Sequential(
+            nn.Linear(self.Qformer.config.hidden_size, self.Qformer.config.hidden_size),
+            nn.Tanh(),
+        )
+
+        logging.info(
+            f"Initialized Blip2QformerCirAlignPrompt with num_query_token={num_query_token}, "
+            f"grid_size={grid_size}, use_grid_pooling={use_grid_pooling}, "
+            f"use_instruction_injection={use_instruction_injection}, "
+            f"instruction_alpha={instruction_alpha}"
+        )
 
 
     def forward(self, samples):
@@ -98,7 +169,7 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
         text = samples["text_input"]
 
         ###============== reference text fusion ===================###
-        # reference image feature  
+        # reference image feature
         image_embeds = self.ln_vision(self.visual_encoder(image))
         image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(
             image.device
@@ -116,6 +187,18 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
             max_length=self.max_txt_len,
             return_tensors="pt",
         ).to(image.device)
+
+        # optional: lightweight instruction injection from text CLS to query tokens
+        if self.use_instruction_injection:
+            text_cls_output = self.Qformer.bert(
+                text_tokens.input_ids,
+                attention_mask=text_tokens.attention_mask,
+                return_dict=True,
+            )
+            text_cls = text_cls_output.last_hidden_state[:, 0, :]  # (B, H)
+            bias = self.instruction_mlp(text_cls).unsqueeze(1)     # (B, 1, H)
+            query_tokens = query_tokens + self.instruction_alpha * bias
+
         # fusion reference image and text tokens into a set of multi-modal tokens
         attention_mask = torch.cat([query_atts, text_tokens.attention_mask], dim=1)
         fusion_output = self.Qformer.bert(
@@ -139,7 +222,7 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
         )
 
         ###============== Fusion-target Contrastive ===================###
-        # reference image feature  
+        # target image feature
         taregt_embeds = self.ln_vision(self.visual_encoder(target))
         target_atts = torch.ones(taregt_embeds.size()[:-1], dtype=torch.long).to(
             image.device
@@ -190,8 +273,10 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
         sim_r2t = sim_r2t / self.temp
         loss_rtc = F.cross_entropy(sim_r2t, targets)
 
-        loss_align = F.mse_loss(fusion_output.last_hidden_state[:, : query_tokens.size(1), :].mean(1), 
-                                prompt_tokens.clone().detach().mean(1))
+        loss_align = F.mse_loss(
+            fusion_output.last_hidden_state[:, : query_tokens.size(1), :].mean(1),
+            prompt_tokens.clone().detach().mean(1)
+        )
 
         return {
             'loss_itc': loss_itc, 
@@ -231,9 +316,7 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
             image_embeds = image_embeds.repeat_interleave(num_beams, dim=0)
         else:
             num_beams = 1
-        image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(
-            image.device
-        )
+        image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(image.device)
 
         model_kwargs = {
             "encoder_hidden_states": image_embeds,
@@ -264,9 +347,7 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
 
     def forward_image(self, image):
         image_embeds = self.ln_vision(self.visual_encoder(image))
-        image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(
-            image.device
-        )
+        image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(image.device)
 
         query_tokens = self.query_tokens.expand(image_embeds.shape[0], -1, -1)
 
@@ -287,10 +368,11 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
         return text_output.last_hidden_state[:, 0, :]
 
     def compute_itm(self, image_inputs, text_ids, text_atts):
-        image_atts = torch.ones(image_inputs.size()[:-1], dtype=torch.long).to(
+        image_embeds = image_inputs
+        image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(
             image_inputs.device
         )
-        query_tokens = self.query_tokens.expand(image_inputs.shape[0], -1, -1)
+        query_tokens = self.query_tokens.expand(image_embeds.shape[0], -1, -1)
         query_atts = torch.ones(query_tokens.size()[:-1], dtype=torch.long).to(
             image_inputs.device
         )
@@ -299,7 +381,7 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
             text_ids,
             query_embeds=query_tokens,
             attention_mask=attention_mask,
-            encoder_hidden_states=image_inputs,
+            encoder_hidden_states=image_embeds,
             encoder_attention_mask=image_atts,
             return_dict=True,
         )
@@ -381,7 +463,7 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
         )
         image_embeds = query_output.last_hidden_state
 
-        # return image_embeds
+        # final image features used for retrieval
         image_features = F.normalize(self.vision_proj(image_embeds), dim=-1)
         return image_features, image_embeds_frozen
 
@@ -512,6 +594,12 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
         freeze_vit = cfg.get("freeze_vit", True)
 
         max_txt_len = cfg.get("max_txt_len", 32)
+        # default grid_size so that H*W == num_query_token (commonly 32)
+        default_grid_size = (4, 8)
+        grid_size = cfg.get("grid_size", default_grid_size)
+        use_grid_pooling = cfg.get("use_grid_pooling", False)
+        use_instruction_injection = cfg.get("use_instruction_injection", False)
+        instruction_alpha = cfg.get("instruction_alpha", 0.1)
 
         model = cls(
             vit_model=vit_model,
@@ -523,6 +611,10 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
             num_query_token=num_query_token,
             cross_attention_freq=cross_attention_freq,
             max_txt_len=max_txt_len,
+            grid_size=grid_size,
+            use_grid_pooling=use_grid_pooling,
+            use_instruction_injection=use_instruction_injection,
+            instruction_alpha=instruction_alpha,
         )
         model.load_checkpoint_from_config(cfg)
 
