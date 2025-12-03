@@ -1,0 +1,46 @@
+# Copyright (c) 2022, salesforce.com, inc.
+# All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
+# For full license text, see the LICENSE file in the repo root or https://opensource.org/licenses/BSD-3-Clause
+
+model:
+  arch: blip2_avgpool_cir_align_prompt
+  model_type: pretrain
+  load_finetuned: False
+  load_pretrained: True
+
+  pretrained: "https://storage.googleapis.com/sfr-vision-language-research/LAVIS/models/BLIP2/blip2_pretrained.pth"
+  finetuned: ""
+
+  # vit encoder
+  vit_model: "eva_clip_g"
+  image_size: 224
+  drop_path_rate: 0
+  use_grad_checkpoint: False
+  vit_precision: "fp16"
+  freeze_vit: True
+
+  # DeCo Projector (replaces Q-Former)
+  num_query_token: 64  # Must be a perfect square (8x8=64)
+  projector_layers: 2
+  
+  # Text settings
+  max_txt_len: 32
+  
+  # Embedding dimension for contrastive learning
+  embed_dim: 256
+
+
+preprocess:
+    vis_processor:
+        train:
+          name: "blip_image_train"
+          image_size: 224
+        eval:
+          name: "blip_image_eval"
+          image_size: 224
+    text_processor:
+        train:
+          name: "blip_caption"
+        eval:
+          name: "blip_caption"

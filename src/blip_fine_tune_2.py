@@ -379,6 +379,8 @@ if __name__ == '__main__':
     parser.add_argument("--loss-align", default=0.4, type=float)
     parser.add_argument("--loss-rtc", default=0.4, type=float)
     parser.add_argument("--loss-itm", default=1, type=float)
+    parser.add_argument("--loss-dense", default=0.5, type=float)
+    parser.add_argument("--loss-tic", default=0.4, type=float)
     parser.add_argument("--validation-frequency", default=1, type=int, help="Validation frequency expressed in epochs")
     parser.add_argument("--target-ratio", default=1.25, type=float, help="TargetPad target ratio")
     parser.add_argument("--transform", default="targetpad", type=str,
@@ -410,6 +412,8 @@ if __name__ == '__main__':
         "loss_rtc": args.loss_rtc,
         "loss_align": args.loss_align,
         "loss_itm": args.loss_itm,
+        "loss_dense": args.loss_dense,
+        "loss_tic": args.loss_tic,
         "save_memory": args.save_memory
     }
     # set_seed(912)
