@@ -1,0 +1,5 @@
+cirr_dataset/
+fashionIQ_dataset/
+/models/
+*.pyc
+__pycache__/

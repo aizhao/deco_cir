@@ -19,8 +19,18 @@ model:
 
   # Q-Former
   num_query_token: 32
-
-
+  use_instruction_injection: false   # 开/关 指令注入
+  instruction_alpha: 0.5
+  use_spatial_adapter: false         # 开/关 空间适配器 (depthwise conv)
+  spatial_kernel_size: 3 
+  spatial_alpha: 0.5
+  use_spatial_gating: false          # 开/关 空间门控机制
+  use_multi_scale_spatial: false     # 开/关 多尺度空间适配器
+  
+  # Text-Guided Fine-Grained Branch (文本条件化细粒度分支)
+  use_text_guided_finegrain: true        # 开/关 文本引导的细粒度分支
+  finegrain_num_tokens: 8            # 细粒度分支的 query token 数量
+  finegrain_alpha: 0.3               # 细粒度特征的融合权重 (0~1)
 preprocess:
     vis_processor:
         train:
