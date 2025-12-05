@@ -17,9 +17,29 @@ model:
   vit_precision: "fp16"
   freeze_vit: True
 
-  # Q-Former
-  num_query_token: 32
-  use_instruction_injection: false   # 开/关 指令注入
+  # 视觉 Token 压缩器选择 (Visual Token Compressor)
+  # 来自 DeCo: Decoupling token compression from semantic abstraction
+  visual_compressor: "qformer"       # 压缩器类型: "qformer" | "avgpool" | "maxpool" | "identity"
+  compressor_num_layers: 2           # MLP 投影层数 (仅对 avgpool/maxpool/identity 有效)
+  compressor_dropout: 0.0            # Dropout 概率
+  
+  # Q-Former + DeCo 双分支架构 (Dual Branch)
+  # 分支1: Q-Former (预训练，语义对齐)
+  # 分支2: DeCo (空间压缩，细节保留) - 完全独立，不经过 Q-Former
+  use_dual_branch: false              # 开/关 双分支架构
+  dual_branch_compressor: "avgpool"  # DeCo 分支的压缩器类型: "avgpool" | "maxpool"
+  dual_branch_num_tokens: 36         # DeCo 分支的 token 数量 (需要是平方数)
+  dual_branch_fusion: "adaptive"     # 融合方式: "adaptive" | "gated" | "concat" | "add" | "learned"
+  dual_branch_text_cond: true        # DeCo 分支是否使用文本条件化
+  dual_branch_text_cond_layers: 2    # 文本条件化层数
+  # 双分支损失函数
+  dual_branch_deco_loss_weight: 0.3  # DeCo 分支独立对比损失权重 (让 DeCo 分支也能直接学习检索)
+  dual_branch_diversity_weight: 0.1  # 分支多样性损失权重 (鼓励两分支捕获不同信息)
+  dual_branch_balance_weight: 0.05   # 融合平衡损失权重 (防止某分支被忽略)
+  
+  # Q-Former / 压缩器共享参数
+  num_query_token: 32                # Q-Former 的 query token 数量 (保持与预训练一致)
+  use_instruction_injection: false   # 开/关 指令注入 (仅 Q-Former)
   instruction_alpha: 0.5
   use_spatial_adapter: false         # 开/关 空间适配器 (depthwise conv)
   spatial_kernel_size: 3 
@@ -28,9 +48,40 @@ model:
   use_multi_scale_spatial: false     # 开/关 多尺度空间适配器
   
   # Text-Guided Fine-Grained Branch (文本条件化细粒度分支)
-  use_text_guided_finegrain: true        # 开/关 文本引导的细粒度分支
+  use_text_guided_finegrain:  false       # 开/关 文本引导的细粒度分支
   finegrain_num_tokens: 8            # 细粒度分支的 query token 数量
   finegrain_alpha: 0.3               # 细粒度特征的融合权重 (0~1)
+  
+  # CAMS-inspired innovations (借鉴 CAMS 的创新模块)
+  use_gated_attention: false         # 开/关 门控交叉注意力 (Gated Cross-Attention)
+  use_multi_space: false             # 开/关 多空间解耦 (Multi-Space Disentanglement)
+  multi_space_loss_weight: 0     # 正交性损失权重
+  
+  # Image-Difference Guided Text Enhancement (图像差异引导的文本增强)
+  use_diff_text_enhancement: false  # 开/关 图像差异引导的文本增强
+  diff_enhancement_alpha: 0.3       # 增强特征的融合权重 (0~1)
+  diff_contrastive_weight: 0.5      # 对比损失权重
+  diff_contrastive_temp: 0.07       # 对比损失温度参数
+  
+  # Hard Negative Mining (难负样本挖掘)
+  use_hard_negative: false          # 开/关 难负样本挖掘
+  hard_negative_weight: 0.3         # 难负样本损失权重
+  hard_negative_types:              # 难负样本类型
+    - color                         # 颜色变换
+    - spatial                       # 空间变换
+    
+  # FLAIR Query Enhancement (FLAIR 增强 Q-Former Query)
+  # 使用 FLAIR 预训练模型的细粒度特征增强 Q-Former 的 query tokens
+  # FLAIR 论文: https://arxiv.org/abs/2412.03561 (CVPR 2025)
+  use_flair_query_enhancement: true  # 开/关 FLAIR Query 增强
+  flair_model_name: "merged30m"       # FLAIR 模型: "cc3m" | "cc12m" | "yfcc15m" | "merged30m"
+  flair_enhancement_type: "attention" # 增强方式: "bias" | "attention" | "gate"
+                                      # - bias: 全局特征偏置
+                                      # - attention: Query 通过 cross-attention 关注 FLAIR 局部特征
+                                      # - gate: 门控融合
+  flair_enhancement_alpha: 0.3        # 增强强度（残差权重）
+  freeze_flair: true                  # 是否冻结 FLAIR backbone
+
 preprocess:
     vis_processor:
         train:

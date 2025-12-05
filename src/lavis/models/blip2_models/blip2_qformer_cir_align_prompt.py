@@ -6,12 +6,14 @@
 """
 import logging
 import math
+import random
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.cuda.amp import autocast as autocast
 from torch.nn import functional as F
+import torchvision.transforms.functional as TF
 
 from lavis.common.registry import registry
 from lavis.models.base_model import all_gather_with_grad, concat_all_gather
@@ -21,6 +23,302 @@ from lavis.models.blip2_models.blip2 import (
     disabled_train,
 )
 from lavis.models.blip_models.blip_outputs import BlipOutput, BlipOutputFeatures
+from lavis.models.blip2_models.flair_query_enhancer import build_flair_query_enhancer
+
+
+class HardNegativeGenerator:
+    """
+    轻量级难负样本生成器
+    通过简单的图像变换生成难负样本，帮助模型学习更细粒度的区分能力
+    
+    变换类型:
+    - color_jitter: 颜色抖动（色相、饱和度、亮度）
+    - spatial_shift: 空间位移
+    - horizontal_flip: 水平翻转
+    - rotation: 小角度旋转
+    - grayscale: 灰度化（移除颜色信息）
+    """
+    
+    def __init__(
+        self,
+        color_jitter_prob=0.5,
+        spatial_shift_prob=0.3,
+        flip_prob=0.3,
+        rotation_prob=0.3,
+        grayscale_prob=0.2,
+        color_jitter_strength=0.4,
+        spatial_shift_range=0.1,
+        rotation_range=15,
+    ):
+        self.color_jitter_prob = color_jitter_prob
+        self.spatial_shift_prob = spatial_shift_prob
+        self.flip_prob = flip_prob
+        self.rotation_prob = rotation_prob
+        self.grayscale_prob = grayscale_prob
+        
+        self.color_jitter_strength = color_jitter_strength
+        self.spatial_shift_range = spatial_shift_range
+        self.rotation_range = rotation_range
+    
+    def color_jitter(self, image):
+        """颜色抖动：随机改变色相、饱和度、亮度"""
+        s = self.color_jitter_strength
+        # 随机调整亮度
+        if random.random() < 0.5:
+            image = TF.adjust_brightness(image, 1 + random.uniform(-s, s))
+        # 随机调整对比度
+        if random.random() < 0.5:
+            image = TF.adjust_contrast(image, 1 + random.uniform(-s, s))
+        # 随机调整饱和度
+        if random.random() < 0.5:
+            image = TF.adjust_saturation(image, 1 + random.uniform(-s, s))
+        # 随机调整色相
+        if random.random() < 0.5:
+            image = TF.adjust_hue(image, random.uniform(-s/2, s/2))
+        return image
+    
+    def spatial_shift(self, image):
+        """空间位移：随机平移图像"""
+        _, h, w = image.shape
+        max_shift_h = int(h * self.spatial_shift_range)
+        max_shift_w = int(w * self.spatial_shift_range)
+        
+        shift_h = random.randint(-max_shift_h, max_shift_h)
+        shift_w = random.randint(-max_shift_w, max_shift_w)
+        
+        # 使用 affine 变换实现平移
+        image = TF.affine(
+            image, 
+            angle=0, 
+            translate=[shift_w, shift_h], 
+            scale=1.0, 
+            shear=0
+        )
+        return image
+    
+    def horizontal_flip(self, image):
+        """水平翻转"""
+        return TF.hflip(image)
+    
+    def rotation(self, image):
+        """小角度旋转"""
+        angle = random.uniform(-self.rotation_range, self.rotation_range)
+        return TF.rotate(image, angle)
+    
+    def grayscale(self, image):
+        """灰度化（移除颜色信息）"""
+        gray = TF.rgb_to_grayscale(image, num_output_channels=3)
+        return gray
+    
+    def generate(self, images):
+        """
+        为一批图像生成难负样本
+        
+        Args:
+            images: (B, C, H, W) 输入图像张量
+            
+        Returns:
+            hard_negatives: (B, C, H, W) 难负样本张量
+        """
+        batch_size = images.size(0)
+        hard_negatives = []
+        
+        for i in range(batch_size):
+            img = images[i]
+            
+            # 随机选择变换组合
+            if random.random() < self.color_jitter_prob:
+                img = self.color_jitter(img)
+            
+            if random.random() < self.spatial_shift_prob:
+                img = self.spatial_shift(img)
+            
+            if random.random() < self.flip_prob:
+                img = self.horizontal_flip(img)
+            
+            if random.random() < self.rotation_prob:
+                img = self.rotation(img)
+            
+            if random.random() < self.grayscale_prob:
+                img = self.grayscale(img)
+            
+            hard_negatives.append(img)
+        
+        return torch.stack(hard_negatives, dim=0)
+    
+    def generate_specific(self, images, transform_type='color'):
+        """
+        生成特定类型的难负样本
+        
+        Args:
+            images: (B, C, H, W) 输入图像张量
+            transform_type: 变换类型 ('color', 'spatial', 'flip', 'grayscale')
+            
+        Returns:
+            hard_negatives: (B, C, H, W) 难负样本张量
+        """
+        batch_size = images.size(0)
+        hard_negatives = []
+        
+        transform_fn = {
+            'color': self.color_jitter,
+            'spatial': self.spatial_shift,
+            'flip': self.horizontal_flip,
+            'rotation': self.rotation,
+            'grayscale': self.grayscale,
+        }.get(transform_type, self.color_jitter)
+        
+        for i in range(batch_size):
+            img = transform_fn(images[i])
+            hard_negatives.append(img)
+        
+        return torch.stack(hard_negatives, dim=0)
+
+
+class GatedCrossAttention(nn.Module):
+    """
+    借鉴 CAMS 的门控交叉注意力机制
+    让 Query 决定哪些 Attention 输出需要保留
+    Gate = sigmoid(Wz·Q × Uz·AttnOutput)
+    """
+    def __init__(self, dim, num_heads=8, dropout=0.1):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
+        
+        # 门控机制权重
+        self.gate_wz = nn.Linear(dim, dim)
+        self.gate_uz = nn.Linear(dim, dim)
+        
+        # 初始化
+        nn.init.normal_(self.gate_wz.weight, std=0.02)
+        nn.init.normal_(self.gate_uz.weight, std=0.02)
+        nn.init.zeros_(self.gate_wz.bias)
+        nn.init.zeros_(self.gate_uz.bias)
+        
+    def forward(self, query, key, value):
+        """
+        Args:
+            query: (B, N_q, D)
+            key: (B, N_k, D)
+            value: (B, N_k, D)
+        Returns:
+            gated_output: (B, N_q, D)
+            attn_weights: (B, N_q, N_k)
+        """
+        # 标准 Cross-Attention
+        attn_output, attn_weights = self.attn(query, key, value)
+        
+        # 门控机制：Query 决定过滤哪些信息
+        gate = torch.sigmoid(self.gate_wz(query) * self.gate_uz(attn_output))
+        
+        # 应用门控
+        gated_output = gate * attn_output
+        
+        return gated_output, attn_weights
+
+
+class MultiSpaceTransformer(nn.Module):
+    """
+    借鉴 CAMS 的多空间解耦
+    使用单独的 Transformer 层将共享特征解耦到不同语义空间
+    """
+    def __init__(self, hidden_dim, num_heads=8, dropout=0.1):
+        super().__init__()
+        self.transformer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=num_heads,
+            dim_feedforward=hidden_dim * 4,
+            dropout=dropout,
+            batch_first=True,
+            activation='gelu'
+        )
+        
+    def forward(self, x):
+        return self.transformer(x)
+
+
+class DifferenceEncoder(nn.Module):
+    """
+    Image-Difference Guided Text Enhancement - Teacher Branch
+    从参考图像和目标图像的差异中提取完整的修改语义
+    只在训练时使用（因为测试时没有目标图像）
+    """
+    def __init__(self, vit_dim=1408, hidden_dim=768, output_dim=256):
+        super().__init__()
+        
+        # 全局差异编码：CLS token 差异
+        self.global_diff_encoder = nn.Sequential(
+            nn.Linear(vit_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, output_dim),
+        )
+        
+        # 初始化
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, std=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+                    
+    def forward(self, ref_feats, tar_feats):
+        """
+        Args:
+            ref_feats: 参考图像 ViT 特征 (B, 257, vit_dim)
+            tar_feats: 目标图像 ViT 特征 (B, 257, vit_dim)
+        Returns:
+            diff_feats: 图像差异表示 (B, output_dim)
+        """
+        # 使用 CLS token 计算全局差异
+        ref_cls = ref_feats[:, 0, :]  # (B, vit_dim)
+        tar_cls = tar_feats[:, 0, :]  # (B, vit_dim)
+        
+        # 编码差异
+        diff = tar_cls - ref_cls
+        diff_feats = self.global_diff_encoder(diff)  # (B, output_dim)
+        
+        return diff_feats
+
+
+class TextEnrichmentModule(nn.Module):
+    """
+    Image-Difference Guided Text Enhancement - Student Branch
+    从文本特征学习预测图像差异的语义
+    训练时：向 Teacher (DifferenceEncoder) 学习
+    测试时：独立使用，已学会"模拟"图像差异信息
+    """
+    def __init__(self, text_dim=768, output_dim=256):
+        super().__init__()
+        
+        # 文本特征增强网络
+        self.text_enrichment = nn.Sequential(
+            nn.Linear(text_dim, text_dim),
+            nn.LayerNorm(text_dim),
+            nn.GELU(),
+            nn.Linear(text_dim, text_dim),
+            nn.LayerNorm(text_dim),
+            nn.GELU(),
+            nn.Linear(text_dim, output_dim),
+        )
+        
+        # 初始化
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, std=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+                    
+    def forward(self, text_feats):
+        """
+        Args:
+            text_feats: 文本特征 (B, text_dim)
+        Returns:
+            enriched_feats: 增强后的文本表示 (B, output_dim)
+        """
+        return self.text_enrichment(text_feats)
 
 
 @registry.register_model("blip2_cir_align_prompt")
@@ -65,6 +363,26 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
         use_text_guided_finegrain=False,
         finegrain_num_tokens=8,
         finegrain_alpha=0.3,
+        # Gated Cross-Attention (借鉴 CAMS 的门控机制)
+        use_gated_attention=False,
+        # Multi-Space Disentanglement (借鉴 CAMS 的多空间解耦)
+        use_multi_space=False,
+        multi_space_loss_weight=0.1,
+        # Image-Difference Guided Text Enhancement (图像差异引导的文本增强)
+        use_diff_text_enhancement=False,
+        diff_enhancement_alpha=0.3,
+        diff_contrastive_weight=0.5,
+        diff_contrastive_temp=0.07,
+        # Hard Negative Mining (难负样本挖掘)
+        use_hard_negative=False,
+        hard_negative_weight=0.3,
+        hard_negative_types=['color', 'spatial'],
+        # FLAIR Query Enhancement (FLAIR 增强 Q-Former Query)
+        use_flair_query_enhancement=False,
+        flair_model_name='merged30m',
+        flair_enhancement_type='attention',  # 'bias', 'attention', 'gate'
+        flair_enhancement_alpha=0.3,
+        freeze_flair=True,
     ):
         super().__init__()
 
@@ -187,6 +505,11 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
         self.finegrain_num_tokens = finegrain_num_tokens
         self.finegrain_alpha = finegrain_alpha
         
+        # 借鉴 CAMS 的创新
+        self.use_gated_attention = use_gated_attention
+        self.use_multi_space = use_multi_space
+        self.multi_space_loss_weight = multi_space_loss_weight
+        
         if self.use_text_guided_finegrain:
             vit_hidden = self.visual_encoder.num_features  # ViT 特征维度 (e.g., 1408)
             qformer_hidden = self.Qformer.config.hidden_size  # Q-Former 特征维度 (e.g., 768)
@@ -202,12 +525,20 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
             self.finegrain_vit_to_kv = nn.Linear(vit_hidden, qformer_hidden * 2)
             
             # Cross-Attention: text query -> image patches
-            self.finegrain_cross_attn = nn.MultiheadAttention(
-                embed_dim=qformer_hidden,
-                num_heads=8,
-                dropout=0.1,
-                batch_first=True,
-            )
+            # 可选使用 Gated Cross-Attention（借鉴 CAMS）
+            if self.use_gated_attention:
+                self.finegrain_cross_attn = GatedCrossAttention(
+                    dim=qformer_hidden,
+                    num_heads=8,
+                    dropout=0.1,
+                )
+            else:
+                self.finegrain_cross_attn = nn.MultiheadAttention(
+                    embed_dim=qformer_hidden,
+                    num_heads=8,
+                    dropout=0.1,
+                    batch_first=True,
+                )
             self.finegrain_ln = nn.LayerNorm(qformer_hidden)
             
             # 将细粒度特征投影到最终 embedding 空间
@@ -218,12 +549,122 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
             nn.init.normal_(self.finegrain_text_proj[2].weight, std=0.02)
             nn.init.normal_(self.finegrain_vit_to_kv.weight, std=0.02)
             nn.init.normal_(self.finegrain_out_proj.weight, std=0.02)
+            
+            # Multi-Space Disentanglement（借鉴 CAMS 的多空间解耦）
+            # 将细粒度特征解耦为：保留空间、修改空间、融合空间
+            if self.use_multi_space:
+                # 三个独立的 Transformer 层用于解耦
+                self.preserve_transformer = MultiSpaceTransformer(qformer_hidden, num_heads=8)
+                self.modify_transformer = MultiSpaceTransformer(qformer_hidden, num_heads=8)
+                self.compose_transformer = MultiSpaceTransformer(qformer_hidden, num_heads=8)
+                
+                # 三个空间的独立投影
+                self.preserve_proj = nn.Linear(qformer_hidden, embed_dim)
+                self.modify_proj = nn.Linear(qformer_hidden, embed_dim)
+                self.compose_proj = nn.Linear(qformer_hidden, embed_dim)
+                
+                # 正交性损失的投影（确保三个空间正交）
+                self.orthogonal_proj = nn.Linear(embed_dim * 3, embed_dim)
+                
+                # 初始化
+                nn.init.normal_(self.preserve_proj.weight, std=0.02)
+                nn.init.normal_(self.modify_proj.weight, std=0.02)
+                nn.init.normal_(self.compose_proj.weight, std=0.02)
+                nn.init.normal_(self.orthogonal_proj.weight, std=0.02)
+            else:
+                self.preserve_transformer = None
+                self.modify_transformer = None
+                self.compose_transformer = None
+                self.preserve_proj = None
+                self.modify_proj = None
+                self.compose_proj = None
+                self.orthogonal_proj = None
         else:
             self.finegrain_text_proj = None
             self.finegrain_vit_to_kv = None
             self.finegrain_cross_attn = None
             self.finegrain_ln = None
             self.finegrain_out_proj = None
+            # Multi-Space 相关
+            self.preserve_transformer = None
+            self.modify_transformer = None
+            self.compose_transformer = None
+            self.preserve_proj = None
+            self.modify_proj = None
+            self.compose_proj = None
+            self.orthogonal_proj = None
+
+        # Image-Difference Guided Text Enhancement (图像差异引导的文本增强)
+        # 训练时利用图像差异信息增强文本表示，测试时模型已学会从文本"模拟"差异信息
+        self.use_diff_text_enhancement = use_diff_text_enhancement
+        self.diff_enhancement_alpha = diff_enhancement_alpha
+        self.diff_contrastive_weight = diff_contrastive_weight
+        self.diff_contrastive_temp = diff_contrastive_temp
+        
+        if self.use_diff_text_enhancement:
+            vit_hidden = self.visual_encoder.num_features  # ViT 特征维度 (e.g., 1408)
+            qformer_hidden = self.Qformer.config.hidden_size  # Q-Former 特征维度 (e.g., 768)
+            
+            # Teacher: 图像差异编码器（只在训练时使用）
+            self.difference_encoder = DifferenceEncoder(
+                vit_dim=vit_hidden,
+                hidden_dim=qformer_hidden,
+                output_dim=embed_dim,
+            )
+            
+            # Student: 文本增强模块（训练和测试都使用）
+            self.text_enrichment_module = TextEnrichmentModule(
+                text_dim=qformer_hidden,
+                output_dim=embed_dim,
+            )
+        else:
+            self.difference_encoder = None
+            self.text_enrichment_module = None
+
+        # Hard Negative Mining (难负样本挖掘)
+        # 通过轻量级图像变换生成难负样本，帮助模型学习更细粒度的区分
+        self.use_hard_negative = use_hard_negative
+        self.hard_negative_weight = hard_negative_weight
+        self.hard_negative_types = hard_negative_types
+        # self.hard_negative_margin = 0.05  # 减小 margin，因为难负样本确实应该相似
+        # self.hard_negative_temp = 0.1     # 温度参数，用于软化损失
+        
+        if self.use_hard_negative:
+            self.hard_negative_generator = HardNegativeGenerator(
+                color_jitter_prob=0.8 if 'color' in hard_negative_types else 0.0,
+                spatial_shift_prob=0.8 if 'spatial' in hard_negative_types else 0.0,
+                flip_prob=0.5 if 'flip' in hard_negative_types else 0.0,
+                rotation_prob=0.5 if 'rotation' in hard_negative_types else 0.0,
+                grayscale_prob=0.3 if 'grayscale' in hard_negative_types else 0.0,
+            )
+        else:
+            self.hard_negative_generator = None
+
+        # FLAIR Query Enhancement (FLAIR 增强 Q-Former Query)
+        # 使用 FLAIR 的细粒度视觉特征增强 Q-Former 的 query tokens
+        self.use_flair_query_enhancement = use_flair_query_enhancement
+        self.flair_model_name = flair_model_name
+        self.flair_enhancement_type = flair_enhancement_type
+        self.flair_enhancement_alpha = flair_enhancement_alpha
+        self.freeze_flair = freeze_flair
+        
+        if self.use_flair_query_enhancement:
+            logging.info(f"Initializing FLAIR Query Enhancement:")
+            logging.info(f"  - FLAIR model: {flair_model_name}")
+            logging.info(f"  - Enhancement type: {flair_enhancement_type}")
+            logging.info(f"  - Enhancement alpha: {flair_enhancement_alpha}")
+            logging.info(f"  - Freeze FLAIR: {freeze_flair}")
+            
+            self.flair_query_enhancer = build_flair_query_enhancer(
+                flair_model_name=flair_model_name,
+                qformer_hidden_size=self.Qformer.config.hidden_size,
+                num_query_tokens=num_query_token,
+                enhancement_type=flair_enhancement_type,
+                enhancement_alpha=flair_enhancement_alpha,
+                freeze_flair=freeze_flair,
+            )
+        else:
+            self.flair_query_enhancer = None
 
     def _apply_spatial_adapter(self, image_embeds):
         """
@@ -276,16 +717,18 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
         image_embeds = torch.cat([cls_tok, patch_tok], dim=1)
         return self.spatial_ln(image_embeds)
 
-    def _extract_text_guided_finegrain_features(self, vit_features, text_features):
+    def _extract_text_guided_finegrain_features(self, vit_features, text_features, return_multi_space=False):
         """
         文本条件化细粒度特征提取
         
         Args:
             vit_features: ViT 输出的 patch tokens (B, N, vit_hidden)，包含 CLS token
             text_features: 文本 CLS 特征 (B, qformer_hidden)
+            return_multi_space: 是否返回多空间特征（用于训练时计算正交损失）
         
         Returns:
             finegrain_feats: 文本引导的细粒度特征 (B, embed_dim)
+            multi_space_feats: (可选) 包含 preserve, modify, compose 特征的字典
         """
         B = vit_features.size(0)
         
@@ -303,14 +746,49 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
         
         # Cross-Attention: text queries attend to image patches
         # 文本特征作为 Q，图像 patch 特征作为 K, V
-        attn_output, _ = self.finegrain_cross_attn(
-            query=text_queries,  # (B, num_tokens, hidden)
-            key=k,               # (B, N-1, hidden)
-            value=v,             # (B, N-1, hidden)
-        )  # (B, num_tokens, hidden)
+        # 可选使用 Gated Cross-Attention（借鉴 CAMS）
+        if self.use_gated_attention:
+            attn_output, _ = self.finegrain_cross_attn(
+                query=text_queries,  # (B, num_tokens, hidden)
+                key=k,               # (B, N-1, hidden)
+                value=v,             # (B, N-1, hidden)
+            )  # (B, num_tokens, hidden)
+        else:
+            attn_output, _ = self.finegrain_cross_attn(
+                query=text_queries,  # (B, num_tokens, hidden)
+                key=k,               # (B, N-1, hidden)
+                value=v,             # (B, N-1, hidden)
+            )  # (B, num_tokens, hidden)
         
         # LayerNorm + 残差连接
-        attn_output = self.finegrain_ln(attn_output + text_queries)
+        attn_output = self.finegrain_ln(attn_output + text_queries)  # (B, num_tokens, hidden)
+        
+        # Multi-Space Disentanglement（借鉴 CAMS 的多空间解耦）
+        if self.use_multi_space and self.preserve_transformer is not None:
+            # 将共享特征解耦到三个独立空间
+            preserve_feats = self.preserve_transformer(attn_output)  # (B, num_tokens, hidden)
+            modify_feats = self.modify_transformer(attn_output)      # (B, num_tokens, hidden)
+            compose_feats = self.compose_transformer(attn_output)    # (B, num_tokens, hidden)
+            
+            # 聚合并投影到 embedding 空间
+            preserve_feats = F.normalize(self.preserve_proj(preserve_feats.mean(dim=1)), dim=-1)  # (B, embed_dim)
+            modify_feats = F.normalize(self.modify_proj(modify_feats.mean(dim=1)), dim=-1)        # (B, embed_dim)
+            compose_feats = F.normalize(self.compose_proj(compose_feats.mean(dim=1)), dim=-1)     # (B, embed_dim)
+            
+            # 融合三个空间的特征
+            # compose_feats 代表"组合空间"，是最终用于检索的特征
+            # 同时使用正交投影融合所有信息
+            concat_feats = torch.cat([preserve_feats, modify_feats, compose_feats], dim=-1)
+            finegrain_feats = F.normalize(self.orthogonal_proj(concat_feats), dim=-1)
+            
+            if return_multi_space:
+                multi_space_feats = {
+                    'preserve': preserve_feats,
+                    'modify': modify_feats,
+                    'compose': compose_feats,
+                }
+                return finegrain_feats, multi_space_feats
+            return finegrain_feats
         
         # 聚合多个 tokens 为单个特征向量
         finegrain_feats = attn_output.mean(dim=1)  # (B, hidden)
@@ -318,7 +796,108 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
         # 投影到最终 embedding 空间并归一化
         finegrain_feats = F.normalize(self.finegrain_out_proj(finegrain_feats), dim=-1)  # (B, embed_dim)
         
+        if return_multi_space:
+            return finegrain_feats, None
         return finegrain_feats
+    
+    def _compute_orthogonal_loss(self, multi_space_feats):
+        """
+        计算正交性损失，确保三个空间语义独立
+        借鉴 CAMS 的 Multi-Space Disentanglement
+        
+        Args:
+            multi_space_feats: 包含 preserve, modify, compose 特征的字典
+        
+        Returns:
+            ortho_loss: 正交性损失标量
+        """
+        if multi_space_feats is None:
+            return 0.0
+        
+        preserve = multi_space_feats['preserve']  # (B, embed_dim)
+        modify = multi_space_feats['modify']      # (B, embed_dim)
+        compose = multi_space_feats['compose']    # (B, embed_dim)
+        
+        # 计算两两之间的余弦相似度，目标是让它们接近 0（正交）
+        sim_pm = (preserve * modify).sum(dim=-1).mean()   # preserve-modify
+        sim_pc = (preserve * compose).sum(dim=-1).mean()  # preserve-compose
+        sim_mc = (modify * compose).sum(dim=-1).mean()    # modify-compose
+        
+        # 正交性损失 = 相似度的平方和
+        ortho_loss = sim_pm ** 2 + sim_pc ** 2 + sim_mc ** 2
+        
+        return ortho_loss
+    
+    def _compute_diff_contrastive_loss(self, text_enriched_feats, diff_feats):
+        """
+        计算图像差异引导的对比损失
+        让文本增强特征与对应的图像差异特征在 batch 内对齐
+        
+        Args:
+            text_enriched_feats: 文本增强模块输出 (B, embed_dim)
+            diff_feats: 图像差异编码器输出 (B, embed_dim)
+        
+        Returns:
+            contrastive_loss: 对比损失标量
+        """
+        # 归一化（双方都参与训练，共同学习对齐）
+        text_enriched_feats = F.normalize(text_enriched_feats, dim=-1)
+        diff_feats = F.normalize(diff_feats, dim=-1)  # 不 detach，让双方共同优化
+        
+        # 计算相似度矩阵
+        sim_matrix = torch.matmul(text_enriched_feats, diff_feats.T) / self.diff_contrastive_temp  # (B, B)
+        
+        # 对角线是正样本
+        labels = torch.arange(sim_matrix.size(0)).to(sim_matrix.device)
+        
+        # 双向对比损失
+        loss_t2d = F.cross_entropy(sim_matrix, labels)      # text_enriched → diff
+        loss_d2t = F.cross_entropy(sim_matrix.T, labels)    # diff → text_enriched
+        
+        return (loss_t2d + loss_d2t) / 2
+    
+    def _compute_hard_negative_loss(self, fusion_feats, target_feats, hard_neg_feats):
+        """
+        计算难负样本对比损失
+        让模型区分真正的目标图像和难负样本（通过变换生成的相似但错误的图像）
+        
+        Args:
+            fusion_feats: 融合特征 (B, embed_dim)，已归一化
+            target_feats: 正样本（目标图像）特征 (B, num_query, embed_dim)，已归一化
+            hard_neg_feats: 难负样本特征 (B, num_query, embed_dim)，已归一化
+        
+        Returns:
+            hard_neg_loss: 难负样本对比损失
+        """
+        # 确保特征归一化
+        # fusion_feats = F.normalize(fusion_feats, dim=-1)
+        # target_feats = F.normalize(target_feats, dim=-1)
+        # hard_neg_feats = F.normalize(hard_neg_feats, dim=-1)
+        
+        # 计算融合特征与正样本的相似度（余弦相似度）
+        sim_pos = torch.matmul(
+            fusion_feats.unsqueeze(1).unsqueeze(1), target_feats.permute(0, 2, 1)
+        ).squeeze()  # (B, num_query)
+        sim_pos, _ = sim_pos.max(-1)  # (B,) 取最大相似度
+        
+        # 计算融合特征与难负样本的相似度
+        sim_neg = torch.matmul(
+            fusion_feats.unsqueeze(1).unsqueeze(1), hard_neg_feats.permute(0, 2, 1)
+        ).squeeze()  # (B, num_query)
+        sim_neg, _ = sim_neg.max(-1)  # (B,) 取最大相似度
+        
+        # 使用更温和的损失函数
+        # 方案1：平滑的 margin loss（使用 sigmoid 软化）
+        margin = 0.2
+        # diff = sim_neg - sim_pos + margin  # 如果 diff > 0，说明难负样本太相似了
+        
+        # 使用平滑的损失：smooth_relu = log(1 + exp(x))，比 relu 更平滑
+        loss = F.relu(sim_neg - sim_pos + margin).mean()
+        
+        # 方案2（备选）：如果方案1还是太大，可以用这个更温和的版本
+        # loss = (diff ** 2).mean()  # 平方损失，更温和
+        
+        return loss
 
     def forward(self, samples):
         image = samples["image"]
@@ -360,6 +939,17 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
             bias = self.instruction_mlp(text_cls).unsqueeze(1)  # (B, 1, H)
             query_tokens = query_tokens + self.instruction_alpha * bias
 
+        # FLAIR Query Enhancement: 使用 FLAIR 的细粒度特征增强 query tokens
+        # 注意：FLAIR 需要特定的图像预处理，这里直接使用原始图像
+        # 在实际部署时，可能需要为 FLAIR 单独预处理图像
+        if self.use_flair_query_enhancement:
+            # 使用 FLAIR 提取文本条件化的细粒度特征，增强 query tokens
+            query_tokens = self.flair_query_enhancer(
+                query_tokens=query_tokens,
+                flair_image=image,  # 使用原始图像（FLAIR 内部会处理）
+                flair_text=text,    # 修改文本
+            )
+
         # fusion reference image and text tokens into a set of multi-modal tokens
         attention_mask = torch.cat([query_atts, text_tokens.attention_mask], dim=1)
         fusion_output = self.Qformer.bert(
@@ -384,15 +974,29 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
         )
         
         # 文本条件化细粒度分支（可选）
+        multi_space_feats = None  # 用于正交损失计算
         if self.use_text_guided_finegrain:
-            # 获取文本 CLS 特征作为条件
-            text_cls_for_finegrain = text_output.last_hidden_state[:, 32, :]  # 使用融合后的文本位置特征
+            # 获取纯文本 CLS 特征作为条件（不含图像信息，避免信息泄露）
+            pure_text_output = self.Qformer.bert(
+                text_tokens.input_ids,
+                attention_mask=text_tokens.attention_mask,
+                return_dict=True,
+            )
+            text_cls_for_finegrain = pure_text_output.last_hidden_state[:, 0, :]  # 纯文本 CLS
             
             # 提取文本引导的细粒度特征
-            finegrain_feats = self._extract_text_guided_finegrain_features(
-                vit_features=image_embeds_raw,  # 使用原始 ViT 特征（未经 spatial adapter）
-                text_features=text_cls_for_finegrain,
-            )
+            # 如果启用了多空间解耦，同时返回多空间特征用于正交损失
+            if self.use_multi_space:
+                finegrain_feats, multi_space_feats = self._extract_text_guided_finegrain_features(
+                    vit_features=image_embeds_raw,  # 使用原始 ViT 特征（未经 spatial adapter）
+                    text_features=text_cls_for_finegrain,
+                    return_multi_space=True,
+                )
+            else:
+                finegrain_feats = self._extract_text_guided_finegrain_features(
+                    vit_features=image_embeds_raw,  # 使用原始 ViT 特征（未经 spatial adapter）
+                    text_features=text_cls_for_finegrain,
+                )
             
             # 融合 Q-Former 特征和细粒度特征
             # fusion_feats = (1 - α) * qformer_feats + α * finegrain_feats
@@ -401,10 +1005,40 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
         else:
             fusion_feats = qformer_feats
 
+        ###============== Image-Difference Guided Text Enhancement ===================###
+        # 图像差异引导的文本增强（可选）
+        diff_feats = None
+        text_enriched_feats = None
+        if self.use_diff_text_enhancement:
+            # 获取目标图像的原始 ViT 特征（用于计算图像差异）
+            target_embeds_raw = self.ln_vision(self.visual_encoder(target))
+            
+            # Teacher: 计算图像差异特征
+            diff_feats = self.difference_encoder(image_embeds_raw, target_embeds_raw)
+            
+            # Student: 从纯文本特征预测差异
+            # 使用纯文本 CLS 特征
+            pure_text_output_for_diff = self.Qformer.bert(
+                text_tokens.input_ids,
+                attention_mask=text_tokens.attention_mask,
+                return_dict=True,
+            )
+            text_cls_for_diff = pure_text_output_for_diff.last_hidden_state[:, 0, :]
+            text_enriched_feats = self.text_enrichment_module(text_cls_for_diff)
+            
+            # 将增强后的文本特征融合到最终特征中
+            text_enriched_feats_norm = F.normalize(text_enriched_feats, dim=-1)
+            fusion_feats = (1 - self.diff_enhancement_alpha) * fusion_feats + self.diff_enhancement_alpha * text_enriched_feats_norm
+            fusion_feats = F.normalize(fusion_feats, dim=-1)
+
         ###============== Fusion-target Contrastive ===================###
         # target image feature
-        taregt_embeds = self.ln_vision(self.visual_encoder(target))
-        taregt_embeds = self._apply_spatial_adapter(taregt_embeds)
+        if self.use_diff_text_enhancement:
+            # 复用已计算的目标图像特征
+            taregt_embeds = self._apply_spatial_adapter(target_embeds_raw)
+        else:
+            taregt_embeds = self.ln_vision(self.visual_encoder(target))
+            taregt_embeds = self._apply_spatial_adapter(taregt_embeds)
         target_atts = torch.ones(taregt_embeds.size()[:-1], dtype=torch.long).to(
             image.device
         )
@@ -457,11 +1091,49 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
         loss_align = F.mse_loss(fusion_output.last_hidden_state[:, : query_tokens.size(1), :].mean(1), 
                                 prompt_tokens.clone().detach().mean(1))
 
-        return {
+        # 计算正交性损失（如果启用了多空间解耦）
+        loss_dict = {
             'loss_itc': loss_itc, 
             'loss_rtc': loss_rtc,
             'loss_align': loss_align
         }
+        
+        if self.use_multi_space and multi_space_feats is not None:
+            loss_ortho = self._compute_orthogonal_loss(multi_space_feats)
+            loss_dict['loss_ortho'] = self.multi_space_loss_weight * loss_ortho
+        
+        # 计算图像差异引导的对比损失（如果启用）
+        if self.use_diff_text_enhancement and diff_feats is not None and text_enriched_feats is not None:
+            loss_diff_contrastive = self._compute_diff_contrastive_loss(text_enriched_feats, diff_feats)
+            loss_dict['loss_diff'] = self.diff_contrastive_weight * loss_diff_contrastive
+        
+        # 难负样本挖掘（如果启用）
+        if self.use_hard_negative and self.training:
+            # 从目标图像生成难负样本
+            with torch.no_grad():
+                hard_neg_images = self.hard_negative_generator.generate(target)
+            
+            # 提取难负样本特征
+            hard_neg_embeds = self.ln_vision(self.visual_encoder(hard_neg_images))
+            hard_neg_embeds = self._apply_spatial_adapter(hard_neg_embeds)
+            hard_neg_atts = torch.ones(hard_neg_embeds.size()[:-1], dtype=torch.long).to(image.device)
+            
+            hard_neg_output = self.Qformer.bert(
+                query_embeds=query_tokens,
+                encoder_hidden_states=hard_neg_embeds,
+                encoder_attention_mask=hard_neg_atts,
+                use_cache=True,
+                return_dict=True,
+            )
+            hard_neg_feats = F.normalize(
+                self.vision_proj(hard_neg_output.last_hidden_state), dim=-1
+            )
+            
+            # 计算难负样本损失
+            loss_hard_neg = self._compute_hard_negative_loss(fusion_feats, target_feats, hard_neg_feats)
+            loss_dict['loss_hard_neg'] = self.hard_negative_weight * loss_hard_neg
+        
+        return loss_dict
 
     @torch.no_grad()
     def generate(
@@ -576,7 +1248,7 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
     
 
     @torch.no_grad()
-    def inference(self, reference_embeds, target_feats, text, reference_embeds_raw=None):
+    def inference(self, reference_embeds, target_feats, text, reference_embeds_raw=None, reference_images=None):
         """
         推理函数：计算融合特征与目标特征的相似度
         
@@ -585,6 +1257,7 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
             target_feats: 目标图像特征
             text: 文本描述
             reference_embeds_raw: 原始 ViT 特征（用于细粒度分支，可选）
+            reference_images: 原始参考图像（用于 FLAIR 增强，可选）
         """
         image_atts = torch.ones(reference_embeds.size()[:-1], dtype=torch.long).to(
             reference_embeds.device
@@ -602,6 +1275,14 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
             max_length=self.max_txt_len,
             return_tensors="pt",
         ).to(reference_embeds.device)
+
+        # FLAIR Query Enhancement（推理时）
+        if self.use_flair_query_enhancement and reference_images is not None:
+            query_tokens = self.flair_query_enhancer(
+                query_tokens=query_tokens,
+                flair_image=reference_images,
+                flair_text=text,
+            )
 
         attention_mask = torch.cat([query_atts, text_tokens.attention_mask], dim=1)
         fusion_output = self.Qformer.bert(
@@ -630,8 +1311,13 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
             # 如果未提供原始 ViT 特征，则使用 reference_embeds（通常已经是原始 ViT 特征）
             vit_features_for_finegrain = reference_embeds_raw if reference_embeds_raw is not None else reference_embeds
             
-            # 获取文本 CLS 特征作为条件
-            text_cls_for_finegrain = text_output.last_hidden_state[:, 32, :]
+            # 获取纯文本 CLS 特征作为条件（不含图像信息，避免信息泄露）
+            pure_text_output = self.Qformer.bert(
+                text_tokens.input_ids,
+                attention_mask=text_tokens.attention_mask,
+                return_dict=True,
+            )
+            text_cls_for_finegrain = pure_text_output.last_hidden_state[:, 0, :]  # 纯文本 CLS
             
             # 提取文本引导的细粒度特征
             finegrain_feats = self._extract_text_guided_finegrain_features(
@@ -644,6 +1330,25 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
             fusion_feats = F.normalize(fusion_feats, dim=-1)
         else:
             fusion_feats = qformer_feats
+
+        # Image-Difference Guided Text Enhancement（推理时）
+        # 测试时没有目标图像，但 Student (text_enrichment_module) 已学会从文本"模拟"差异信息
+        if self.use_diff_text_enhancement:
+            # 获取纯文本 CLS 特征
+            pure_text_output_for_diff = self.Qformer.bert(
+                text_tokens.input_ids,
+                attention_mask=text_tokens.attention_mask,
+                return_dict=True,
+            )
+            text_cls_for_diff = pure_text_output_for_diff.last_hidden_state[:, 0, :]
+            
+            # 文本增强：Student 已学会预测差异信息
+            text_enriched_feats = self.text_enrichment_module(text_cls_for_diff)
+            text_enriched_feats = F.normalize(text_enriched_feats, dim=-1)
+            
+            # 融合到最终特征
+            fusion_feats = (1 - self.diff_enhancement_alpha) * fusion_feats + self.diff_enhancement_alpha * text_enriched_feats
+            fusion_feats = F.normalize(fusion_feats, dim=-1)
 
         sim_t2q = torch.matmul(
             fusion_feats.unsqueeze(1).unsqueeze(1), target_feats.permute(0, 2, 1)
@@ -824,6 +1529,29 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
         use_text_guided_finegrain = cfg.get("use_text_guided_finegrain", False)
         finegrain_num_tokens = cfg.get("finegrain_num_tokens", 8)
         finegrain_alpha = cfg.get("finegrain_alpha", 0.3)
+        
+        # CAMS-inspired innovations (借鉴 CAMS 的创新)
+        use_gated_attention = cfg.get("use_gated_attention", False)
+        use_multi_space = cfg.get("use_multi_space", False)
+        multi_space_loss_weight = cfg.get("multi_space_loss_weight", 0.1)
+        
+        # Image-Difference Guided Text Enhancement (图像差异引导的文本增强)
+        use_diff_text_enhancement = cfg.get("use_diff_text_enhancement", False)
+        diff_enhancement_alpha = cfg.get("diff_enhancement_alpha", 0.3)
+        diff_contrastive_weight = cfg.get("diff_contrastive_weight", 0.5)
+        diff_contrastive_temp = cfg.get("diff_contrastive_temp", 0.07)
+        
+        # Hard Negative Mining (难负样本挖掘)
+        use_hard_negative = cfg.get("use_hard_negative", False)
+        hard_negative_weight = cfg.get("hard_negative_weight", 0.3)
+        hard_negative_types = cfg.get("hard_negative_types", ['color', 'spatial'])
+        
+        # FLAIR Query Enhancement (FLAIR 增强 Q-Former Query)
+        use_flair_query_enhancement = cfg.get("use_flair_query_enhancement", False)
+        flair_model_name = cfg.get("flair_model_name", "merged30m")
+        flair_enhancement_type = cfg.get("flair_enhancement_type", "attention")
+        flair_enhancement_alpha = cfg.get("flair_enhancement_alpha", 0.3)
+        freeze_flair = cfg.get("freeze_flair", True)
 
         model = cls(
             vit_model=vit_model,
@@ -845,6 +1573,22 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
             use_text_guided_finegrain=use_text_guided_finegrain,
             finegrain_num_tokens=finegrain_num_tokens,
             finegrain_alpha=finegrain_alpha,
+            use_gated_attention=use_gated_attention,
+            use_multi_space=use_multi_space,
+            multi_space_loss_weight=multi_space_loss_weight,
+            use_diff_text_enhancement=use_diff_text_enhancement,
+            diff_enhancement_alpha=diff_enhancement_alpha,
+            diff_contrastive_weight=diff_contrastive_weight,
+            diff_contrastive_temp=diff_contrastive_temp,
+            use_hard_negative=use_hard_negative,
+            hard_negative_weight=hard_negative_weight,
+            hard_negative_types=hard_negative_types,
+            # FLAIR Query Enhancement
+            use_flair_query_enhancement=use_flair_query_enhancement,
+            flair_model_name=flair_model_name,
+            flair_enhancement_type=flair_enhancement_type,
+            flair_enhancement_alpha=flair_enhancement_alpha,
+            freeze_flair=freeze_flair,
         )
         model.load_checkpoint_from_config(cfg)
 

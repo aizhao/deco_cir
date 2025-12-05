@@ -293,9 +293,12 @@ def clip_finetune_cirr(num_epochs: int, blip_model_name: str, backbone: str, lea
                 loss_dict = blip_model({"image":reference_images, "target":target_images, "text_input":captions})
                 loss = 0.
                 for key in loss_dict.keys():
-                    if key != 'loss_itc':
+                    if key == 'loss_itc':
+                        loss += loss_dict[key]
+                    elif key in kwargs:
                         loss += kwargs[key] * loss_dict[key]
                     else:
+                        # 未指定权重的 loss 直接加（如 loss_ortho，其权重已在模型内部处理）
                         loss += loss_dict[key]
             # Backpropagate and update the weights
             scaler.scale(loss).backward()
