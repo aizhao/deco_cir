@@ -20,6 +20,7 @@ from lavis.models.blip2_models.blip2 import (
     disabled_train,
 )
 from lavis.models.blip_models.blip_outputs import BlipOutput, BlipOutputFeatures
+from lavis.models.blip2_models.spatial_branch import QwenSpatialAdapter
 
 
 @registry.register_model("blip2_cir_align_prompt")
@@ -53,6 +54,11 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
         cross_attention_freq=2,
         embed_dim=256,
         max_txt_len=32,
+        # 2D-RoPE Spatial Adapter configuration
+        use_spatial_adapter=False,
+        spatial_adapter_hidden_dim=768,
+        spatial_adapter_num_heads=12,
+        spatial_adapter_depth=2,
     ):
         super().__init__()
 
@@ -90,6 +96,77 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
             torch.zeros(1, num_query_token, self.Qformer.config.hidden_size)
         )
         self.prompt_tokens.data.normal_(mean=0.0, std=self.Qformer.config.initializer_range)
+        
+        # 2D-RoPE Spatial Adapter (Qwen-style) - Parallel Branch
+        self.use_spatial_adapter = use_spatial_adapter
+        if use_spatial_adapter:
+            self.spatial_adapter = QwenSpatialAdapter(
+                input_dim=self.visual_encoder.num_features,
+                hidden_dim=spatial_adapter_hidden_dim,
+                num_heads=spatial_adapter_num_heads,
+                depth=spatial_adapter_depth,
+            )
+            logging.info(
+                f"Initialized 2D-RoPE Spatial Adapter (Parallel Branch): "
+                f"hidden_dim={spatial_adapter_hidden_dim}, "
+                f"num_heads={spatial_adapter_num_heads}, "
+                f"depth={spatial_adapter_depth}"
+            )
+    
+    def _apply_spatial_branch(self, vit_output):
+        """
+        Apply 2D-RoPE Spatial Adapter as a parallel branch.
+        Returns:
+            enhanced_embeds: Spatially enhanced embeddings, shape [B, N, C]
+        """
+        # Separate CLS token and patch tokens
+        cls_token = vit_output[:, :1, :]      # [B, 1, C]
+        patch_tokens = vit_output[:, 1:, :]   # [B, N-1, C]
+        
+        # Parallel branch: compute spatial delta
+        # Note: spatial_adapter expects patch tokens only (no CLS)
+        # 推理时禁用梯度以节省显存
+        if self.training:
+            spatial_delta = self.spatial_adapter(patch_tokens)  # [B, N-1, C]
+        else:
+            with torch.no_grad():
+                spatial_delta = self.spatial_adapter(patch_tokens)  # [B, N-1, C]
+        
+        # Feature fusion: add spatial delta to original semantic features
+        enhanced_patches = patch_tokens + spatial_delta  # [B, N-1, C]
+        
+        # Reconstruct full sequence with CLS token
+        enhanced_embeds = torch.cat([cls_token, enhanced_patches], dim=1)  # [B, N, C]
+        
+        return enhanced_embeds
+    
+    def _extract_visual_features(self, image, use_grad_for_vit=False):
+        """
+        Extract visual features with optional spatial enhancement.
+        
+        Args:
+            image: Input image tensor, shape [B, 3, H, W]
+            use_grad_for_vit: Whether to compute gradients for ViT
+                             (False for frozen ViT, True if needed)
+        
+        Returns:
+            image_embeds: Visual embeddings after LayerNorm and optional spatial enhancement
+        """
+        if use_grad_for_vit:
+            # Compute gradients for ViT (not typical for SPRC)
+            vit_output = self.visual_encoder(image)
+            image_embeds = self.ln_vision(vit_output)
+        else:
+            # Frozen ViT: no gradients
+            with torch.no_grad():
+                vit_output = self.visual_encoder(image)
+            image_embeds = self.ln_vision(vit_output)
+        
+        # Apply spatial branch if enabled
+        if self.use_spatial_adapter:
+            image_embeds = self._apply_spatial_branch(image_embeds)
+        
+        return image_embeds
 
 
     def forward(self, samples):
@@ -98,8 +175,9 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
         text = samples["text_input"]
 
         ###============== reference text fusion ===================###
-        # reference image feature  
-        image_embeds = self.ln_vision(self.visual_encoder(image))
+        # reference image feature (with parallel spatial branch if enabled)
+        image_embeds = self._extract_visual_features(image, use_grad_for_vit=False)
+        
         image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(
             image.device
         )
@@ -139,8 +217,9 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
         )
 
         ###============== Fusion-target Contrastive ===================###
-        # reference image feature  
-        taregt_embeds = self.ln_vision(self.visual_encoder(target))
+        # target image feature (with parallel spatial branch if enabled)
+        taregt_embeds = self._extract_visual_features(target, use_grad_for_vit=False)
+        
         target_atts = torch.ones(taregt_embeds.size()[:-1], dtype=torch.long).to(
             image.device
         )
@@ -225,7 +304,8 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
             captions (list): A list of strings of length batch_size * num_captions.
         """
         image = samples["image"]
-        image_embeds = self.ln_vision(self.visual_encoder(image))
+        # Extract visual features (with parallel spatial branch if enabled)
+        image_embeds = self._extract_visual_features(image, use_grad_for_vit=False)
 
         if not use_nucleus_sampling:
             image_embeds = image_embeds.repeat_interleave(num_beams, dim=0)
@@ -250,7 +330,7 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
         outputs = self.Qformer.generate(
             input_ids=input_ids,
             query_embeds=query_tokens,
-            max_length=max_length,
+            max_length=max_length,  
             min_length=min_length,
             num_beams=num_beams,
             do_sample=use_nucleus_sampling,
@@ -262,8 +342,11 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
         captions = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
         return captions
 
+    @torch.no_grad()
     def forward_image(self, image):
-        image_embeds = self.ln_vision(self.visual_encoder(image))
+        # Extract visual features (with parallel spatial branch if enabled)
+        image_embeds = self._extract_visual_features(image, use_grad_for_vit=False)
+        
         image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(
             image.device
         )
@@ -364,8 +447,14 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
     @torch.no_grad()
     def extract_target_features(self, image, mode='mean'):
         with self.maybe_autocast():
-            image_embeds_frozen = self.ln_vision(self.visual_encoder(image))
+            vit_output = self.visual_encoder(image)
+            image_embeds_frozen = self.ln_vision(vit_output)
         image_embeds_frozen = image_embeds_frozen.float()
+        
+        # Apply parallel spatial branch if enabled
+        if self.use_spatial_adapter:
+            image_embeds_frozen = self._apply_spatial_branch(image_embeds_frozen)
+        
         image_atts = torch.ones(
             image_embeds_frozen.size()[:-1], dtype=torch.long
         ).to(self.device)
@@ -423,8 +512,14 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
             ), "Image is not provided for mode 'image' or 'multimodal'"
             # return query features
             with self.maybe_autocast():
-                image_embeds_frozen = self.ln_vision(self.visual_encoder(image))
+                vit_output = self.visual_encoder(image)
+                image_embeds_frozen = self.ln_vision(vit_output)
             image_embeds_frozen = image_embeds_frozen.float()
+            
+            # Apply parallel spatial branch if enabled
+            if self.use_spatial_adapter:
+                image_embeds_frozen = self._apply_spatial_branch(image_embeds_frozen)
+            
             image_atts = torch.ones(
                 image_embeds_frozen.size()[:-1], dtype=torch.long
             ).to(self.device)
@@ -463,8 +558,14 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
         elif mode == "multimodal":
             # return multimodel query features
             with self.maybe_autocast():
-                image_embeds_frozen = self.ln_vision(self.visual_encoder(image))
+                vit_output = self.visual_encoder(image)
+                image_embeds_frozen = self.ln_vision(vit_output)
             image_embeds_frozen = image_embeds_frozen.float()
+            
+            # Apply parallel spatial branch if enabled
+            if self.use_spatial_adapter:
+                image_embeds_frozen = self._apply_spatial_branch(image_embeds_frozen)
+            
             image_atts = torch.ones(
                 image_embeds_frozen.size()[:-1], dtype=torch.long
             ).to(self.device)
@@ -512,6 +613,12 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
         freeze_vit = cfg.get("freeze_vit", True)
 
         max_txt_len = cfg.get("max_txt_len", 32)
+        
+        # 2D-RoPE Spatial Adapter configuration
+        use_spatial_adapter = cfg.get("use_spatial_adapter", False)
+        spatial_adapter_hidden_dim = cfg.get("spatial_adapter_hidden_dim", 768)
+        spatial_adapter_num_heads = cfg.get("spatial_adapter_num_heads", 12)
+        spatial_adapter_depth = cfg.get("spatial_adapter_depth", 2)
 
         model = cls(
             vit_model=vit_model,
@@ -523,6 +630,11 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
             num_query_token=num_query_token,
             cross_attention_freq=cross_attention_freq,
             max_txt_len=max_txt_len,
+            # 2D-RoPE Spatial Adapter
+            use_spatial_adapter=use_spatial_adapter,
+            spatial_adapter_hidden_dim=spatial_adapter_hidden_dim,
+            spatial_adapter_num_heads=spatial_adapter_num_heads,
+            spatial_adapter_depth=spatial_adapter_depth,
         )
         model.load_checkpoint_from_config(cfg)
 
@@ -535,3 +647,14 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
         k_test = task_cfg.k_test
 
         return compute_sim_matrix(model=self, data_loader=data_loader, k_test=k_test)
+    
+    def get_spatial_adapter_gate_value(self):
+        """
+        Get the current gate value of the spatial adapter for monitoring.
+        
+        Returns:
+            float: The gate value, or None if spatial adapter is not enabled
+        """
+        if self.use_spatial_adapter:
+            return self.spatial_adapter.get_gate_value()
+        return None
