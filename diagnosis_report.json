@@ -1,0 +1,145 @@
+{
+  "module_existence": {
+    "visual_encoder": true,
+    "Qformer": true,
+    "query_tokens": true,
+    "tokenizer": true,
+    "semantic_proj": true,
+    "qwen_semantic": false,
+    "blip2_gen_semantic": false,
+    "blip2_semantic": false,
+    "instruction_expansion": false,
+    "fusion_module": false,
+    "dual_level_fusion": true,
+    "query_generator": true,
+    "vision_proj": true,
+    "text_proj": true
+  },
+  "configurations": {
+    "semantic_model_type": "qformer_native",
+    "use_semantic_stream": true,
+    "use_fusion_module": false,
+    "use_dual_level_fusion": true,
+    "use_spatial_align": false,
+    "use_change_preserve": false,
+    "adaptive_fusion": true,
+    "embed_dim": 256,
+    "semantic_dim": "\u672a\u8bbe\u7f6e"
+  },
+  "parameters": {
+    "total": 1205880032,
+    "trainable": 219985504,
+    "frozen": 985894528,
+    "per_module": {
+      "visual_encoder": {
+        "total": 985894528,
+        "trainable": 0
+      },
+      "Qformer": {
+        "total": 186282811,
+        "trainable": 186282811
+      },
+      "semantic_proj": {
+        "total": 590592,
+        "trainable": 590592
+      },
+      "dual_level_fusion": {
+        "total": 31900418,
+        "trainable": 31900418
+      },
+      "query_generator": {
+        "total": 789024,
+        "trainable": 789024
+      }
+    }
+  },
+  "forward_pass": {
+    "success": true,
+    "losses": {
+      "loss_itc": 0.6905497312545776,
+      "loss_rtc": 0.6985616683959961,
+      "loss_align": 0.9970124959945679,
+      "loss_dual": 0.002970457775518298
+    },
+    "features": {}
+  },
+  "gradient_flow": {
+    "modules": {
+      "semantic_proj": {
+        "has_gradient": true,
+        "avg_grad_norm": 0.9210730269551277,
+        "max_grad_norm": 1.714022159576416
+      },
+      "dual_level_fusion": {
+        "has_gradient": true,
+        "avg_grad_norm": 0.41945565843277355,
+        "max_grad_norm": 4.3062214851379395
+      },
+      "query_generator": {
+        "has_gradient": true,
+        "avg_grad_norm": 0.6500963703063982,
+        "max_grad_norm": 2.2125186920166016
+      },
+      "vision_proj": {
+        "has_gradient": true,
+        "avg_grad_norm": 3.9459102898836136,
+        "max_grad_norm": 7.629182815551758
+      },
+      "text_proj": {
+        "has_gradient": true,
+        "avg_grad_norm": 3.9200958013534546,
+        "max_grad_norm": 7.232545852661133
+      }
+    },
+    "success": true
+  },
+  "feature_statistics": {
+    "\u8bed\u4e49\u6295\u5f71\u8f93\u51fa": {
+      "shape": [
+        2,
+        768
+      ],
+      "mean": 0.002613309770822525,
+      "std": 0.2978088855743408,
+      "min": -1.2066798210144043,
+      "max": 0.7811418771743774
+    },
+    "\u53cc\u5c42\u878d\u5408\u8f93\u51fa": {
+      "shape": [
+        2,
+        32,
+        768
+      ],
+      "mean": 0.0,
+      "std": 0.9999805688858032,
+      "min": -3.5751681327819824,
+      "max": 3.3437023162841797
+    },
+    "\u67e5\u8be2\u751f\u6210\u8f93\u51fa": {
+      "shape": [
+        2,
+        256
+      ],
+      "mean": 0.00042111368384212255,
+      "std": 0.06255970895290375,
+      "min": -0.16581322252750397,
+      "max": 0.17135658860206604
+    },
+    "\u89c6\u89c9\u6295\u5f71\u8f93\u51fa": {
+      "shape": [
+        2,
+        32,
+        256
+      ],
+      "mean": -0.023488802835345268,
+      "std": 0.47548770904541016,
+      "min": -2.889955759048462,
+      "max": 3.2827706336975098
+    },
+    "success": true
+  },
+  "dual_level_fusion": {
+    "enabled": true,
+    "forward_test": "passed"
+  }
+}

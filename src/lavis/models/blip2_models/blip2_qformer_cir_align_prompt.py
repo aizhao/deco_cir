@@ -21,6 +21,7 @@ from lavis.models.blip2_models.blip2 import (
 )
 from lavis.models.blip_models.blip_outputs import BlipOutput, BlipOutputFeatures
 from lavis.models.blip2_models.spatial_branch import QwenSpatialAdapter
+from lavis.models.blip2_models.glofnd_loss import GloFNDLoss
 
 
 @registry.register_model("blip2_cir_align_prompt")
@@ -59,6 +60,13 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
         spatial_adapter_hidden_dim=768,
         spatial_adapter_num_heads=12,
         spatial_adapter_depth=2,
+        # GloFND configuration
+        use_glofnd=False,
+        glofnd_data_size=50000,
+        glofnd_alpha=1e-3,
+        glofnd_lr_lda=0.05,
+        glofnd_start_update=15,
+        glofnd_lda_start=15,
     ):
         super().__init__()
 
@@ -106,12 +114,60 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
                 num_heads=spatial_adapter_num_heads,
                 depth=spatial_adapter_depth,
             )
+            # Project spatial-pooled ViT/adapter features into retrieval embedding space
+            self.spatial_proj = nn.Linear(self.visual_encoder.num_features, embed_dim)
+            # Project text/query embedding into spatial retrieval space (same dim as embed_dim)
+            self.spatial_text_proj = nn.Sequential(
+                nn.LayerNorm(embed_dim),
+                nn.Linear(embed_dim, embed_dim, bias=False),
+            )
+            # Separate temperature for spatial branch (initialized to match self.temp scale)
+            self.temp_spatial = nn.Parameter(0.07 * torch.ones([]))
+            # Attention pooling query for spatial tokens (in ViT hidden dim)
+            self.spatial_pool_query = nn.Parameter(torch.zeros(1, self.visual_encoder.num_features))
+            nn.init.normal_(self.spatial_pool_query, std=0.02)
             logging.info(
                 f"Initialized 2D-RoPE Spatial Adapter (Parallel Branch): "
                 f"hidden_dim={spatial_adapter_hidden_dim}, "
                 f"num_heads={spatial_adapter_num_heads}, "
                 f"depth={spatial_adapter_depth}"
             )
+        else:
+            self.spatial_adapter = None
+            self.spatial_proj = None
+            self.spatial_text_proj = None
+            self.temp_spatial = None
+            self.spatial_pool_query = None
+        
+        # GloFND (Global False Negative Detection) - Optional module
+        self.use_glofnd = use_glofnd
+        if use_glofnd:
+            # Create separate GloFND losses for ITC and RTC
+            # Note: temperature will be dynamically updated from self.temp during forward
+            self.glofnd_loss_itc = GloFNDLoss(
+                data_size=glofnd_data_size,
+                temperature=0.07,  # Initial value, will be updated dynamically
+                alpha=glofnd_alpha,
+                lr_lda=glofnd_lr_lda,
+                start_update=glofnd_start_update,
+                lda_start=glofnd_lda_start,
+            )
+            self.glofnd_loss_rtc = GloFNDLoss(
+                data_size=glofnd_data_size,
+                temperature=0.07,  # Initial value, will be updated dynamically
+                alpha=glofnd_alpha,
+                lr_lda=glofnd_lr_lda,
+                start_update=glofnd_start_update,
+                lda_start=glofnd_lda_start,
+            )
+            logging.info(
+                f"Initialized GloFND Loss: data_size={glofnd_data_size}, "
+                f"alpha={glofnd_alpha}, lr_lda={glofnd_lr_lda}, "
+                f"start_update={glofnd_start_update}, lda_start={glofnd_lda_start}"
+            )
+        else:
+            self.glofnd_loss_itc = None
+            self.glofnd_loss_rtc = None
     
     def _apply_spatial_branch(self, vit_output):
         """
@@ -124,9 +180,9 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
         patch_tokens = vit_output[:, 1:, :]   # [B, N-1, C]
         
         # Parallel branch: compute spatial delta
-        # Note: spatial_adapter expects patch tokens only (no CLS)
-        # 推理时禁用梯度以节省显存
-        if self.training:
+        # 使用 torch.is_grad_enabled() 更可靠地检测是否需要计算梯度
+        # 只有在训练模式且梯度启用时才计算梯度
+        if torch.is_grad_enabled() and self.training:
             spatial_delta = self.spatial_adapter(patch_tokens)  # [B, N-1, C]
         else:
             with torch.no_grad():
@@ -157,16 +213,34 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
             vit_output = self.visual_encoder(image)
             image_embeds = self.ln_vision(vit_output)
         else:
-            # Frozen ViT: no gradients
+            # Frozen ViT: no gradients (包括 ln_vision)
             with torch.no_grad():
                 vit_output = self.visual_encoder(image)
-            image_embeds = self.ln_vision(vit_output)
-        
-        # Apply spatial branch if enabled
-        if self.use_spatial_adapter:
-            image_embeds = self._apply_spatial_branch(image_embeds)
+                image_embeds = self.ln_vision(vit_output)
         
         return image_embeds
+
+    def _extract_spatial_vec(self, vit_output, normalize=True):
+        """
+        Compute a pooled spatial feature vector from ViT tokens using the RoPE spatial adapter.
+
+        NOTE: This DOES NOT affect Q-Former inputs. It's a parallel branch feature for rerank/loss.
+        """
+        if not self.use_spatial_adapter:
+            return None
+        # vit_output: [B, 1+P, C]
+        enhanced = self._apply_spatial_branch(vit_output)  # [B, 1+P, C]
+        patch_tokens = enhanced[:, 1:, :]                  # [B, P, C]
+        # Attention pooling (learnable query) instead of mean pooling
+        # scores: [B, P]
+        scores = torch.matmul(patch_tokens, self.spatial_pool_query.t()).squeeze(-1)
+        scores = scores / (patch_tokens.shape[-1] ** 0.5)
+        attn = torch.softmax(scores, dim=-1).unsqueeze(-1)  # [B, P, 1]
+        pooled = (patch_tokens * attn).sum(dim=1)           # [B, C]
+        vec = self.spatial_proj(pooled)                    # [B, embed_dim]
+        if normalize:
+            vec = F.normalize(vec, dim=-1)
+        return vec
 
 
     def forward(self, samples):
@@ -175,7 +249,7 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
         text = samples["text_input"]
 
         ###============== reference text fusion ===================###
-        # reference image feature (with parallel spatial branch if enabled)
+        # reference image feature for Q-Former (DO NOT apply spatial branch here)
         image_embeds = self._extract_visual_features(image, use_grad_for_vit=False)
         
         image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(
@@ -217,7 +291,7 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
         )
 
         ###============== Fusion-target Contrastive ===================###
-        # target image feature (with parallel spatial branch if enabled)
+        # target image feature for Q-Former (DO NOT apply spatial branch here)
         taregt_embeds = self._extract_visual_features(target, use_grad_for_vit=False)
         
         target_atts = torch.ones(taregt_embeds.size()[:-1], dtype=torch.long).to(
@@ -239,12 +313,36 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
         ).squeeze()
 
         sim_i2t, _ = sim_t2q.max(-1)
-        sim_i2t = sim_i2t / self.temp
+        temp_main = torch.clamp(self.temp, min=1e-3)
+        sim_i2t = sim_i2t / temp_main
         bs = image.size(0)
         targets = torch.linspace(0,  bs - 1, bs, dtype=int).to(
             image.device
         )
-        loss_itc = F.cross_entropy(sim_i2t, targets)
+        
+        # Get sample indices for GloFND (if provided in samples, otherwise use batch indices)
+        indices = samples.get("indices", None)
+        if indices is None:
+            indices = torch.arange(bs, device=image.device, dtype=torch.long)
+        else:
+            indices = indices.to(image.device)
+        
+        # Compute ITC loss (with or without GloFND)
+        if self.use_glofnd and self.glofnd_loss_itc is not None:
+            # Update temperature from learnable parameter
+            if isinstance(self.temp, nn.Parameter):
+                self.glofnd_loss_itc.temperature = torch.clamp(self.temp.detach(), min=1e-3)
+            # Aggregate target features for GloFND (mean pooling over query tokens)
+            target_feats_agg = target_feats.mean(dim=1)  # [B, D]
+            loss_itc, log_dict_itc = self.glofnd_loss_itc(
+                anchor_features=fusion_feats,
+                target_features=target_feats_agg,
+                indices=indices,
+            )
+        else:
+            # Standard InfoNCE loss
+            loss_itc = F.cross_entropy(sim_i2t, targets)
+            log_dict_itc = {}
 
          ###============== Relative Contrastive ===================###
         prompt_tokens = self.prompt_tokens.expand(image_embeds.shape[0], -1, -1)
@@ -266,17 +364,81 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
         ).squeeze()
 
         sim_r2t, _ = sim_r2t.max(-1)
-        sim_r2t = sim_r2t / self.temp
-        loss_rtc = F.cross_entropy(sim_r2t, targets)
+        sim_r2t = sim_r2t / temp_main
+        
+        # Compute RTC loss (with or without GloFND)
+        if self.use_glofnd and self.glofnd_loss_rtc is not None:
+            # Update temperature from learnable parameter
+            if isinstance(self.temp, nn.Parameter):
+                self.glofnd_loss_rtc.temperature = torch.clamp(self.temp.detach(), min=1e-3)
+            # Aggregate target features for GloFND (mean pooling over query tokens)
+            target_feats_agg = target_feats.mean(dim=1)  # [B, D]
+            loss_rtc, log_dict_rtc = self.glofnd_loss_rtc(
+                anchor_features=text_only_feat,
+                target_features=target_feats_agg,
+                indices=indices,
+            )
+        else:
+            # Standard InfoNCE loss
+            loss_rtc = F.cross_entropy(sim_r2t, targets)
+            log_dict_rtc = {}
 
         loss_align = F.mse_loss(fusion_output.last_hidden_state[:, : query_tokens.size(1), :].mean(1), 
                                 prompt_tokens.clone().detach().mean(1))
 
-        return {
+        out = {
             'loss_itc': loss_itc, 
             'loss_rtc': loss_rtc,
             'loss_align': loss_align
         }
+        
+        # Add GloFND logging statistics
+        if self.use_glofnd:
+            if log_dict_itc:
+                out.update({
+                    'glofnd_itc_lda_mean': log_dict_itc.get('lda_mean', 0.0),
+                    'glofnd_itc_lda_std': log_dict_itc.get('lda_std', 0.0),
+                    'glofnd_itc_filtered_ratio': log_dict_itc.get('filtered_ratio', 0.0),
+                    'glofnd_itc_num_negatives': log_dict_itc.get('num_negatives_per_sample', 0.0),
+                })
+            if log_dict_rtc:
+                out.update({
+                    'glofnd_rtc_lda_mean': log_dict_rtc.get('lda_mean', 0.0),
+                    'glofnd_rtc_lda_std': log_dict_rtc.get('lda_std', 0.0),
+                    'glofnd_rtc_filtered_ratio': log_dict_rtc.get('filtered_ratio', 0.0),
+                    'glofnd_rtc_num_negatives': log_dict_rtc.get('num_negatives_per_sample', 0.0),
+                })
+
+        # ================= Parallel Spatial Branch (optional extra losses) =================
+        # Use RoPE spatial adapter ONLY to produce an auxiliary similarity (does not feed Q-Former).
+        if self.use_spatial_adapter and self.spatial_proj is not None:
+            # Spatial vectors from ref/target images (B, embed_dim)
+            spatial_ref_vec = self._extract_spatial_vec(image_embeds, normalize=True)
+            spatial_target_vec = self._extract_spatial_vec(taregt_embeds, normalize=True)
+            if spatial_ref_vec is not None and spatial_target_vec is not None:
+                # Build spatial queries conditioned on text/query embedding
+                # ITC: use fusion_feats (ref+text) as conditioning
+                spatial_q_itc = F.normalize(
+                    spatial_ref_vec + self.spatial_text_proj(fusion_feats),
+                    dim=-1,
+                )
+                # RTC: use text_only_feat (relative/prompt) as conditioning (anchored on ref spatial)
+                spatial_q_rtc = F.normalize(
+                    spatial_ref_vec + self.spatial_text_proj(text_only_feat),
+                    dim=-1,
+                )
+
+                # Proper batch contrastive logits: (B, B)
+                logits_spatial_itc = (spatial_q_itc @ spatial_target_vec.t()) / self.temp_spatial
+                loss_spatial_itc = F.cross_entropy(logits_spatial_itc, targets)
+
+                logits_spatial_rtc = (spatial_q_rtc @ spatial_target_vec.t()) / self.temp_spatial
+                loss_spatial_rtc = F.cross_entropy(logits_spatial_rtc, targets)
+
+                out["loss_spatial_itc"] = loss_spatial_itc
+                out["loss_spatial_rtc"] = loss_spatial_rtc
+
+        return out
 
     @torch.no_grad()
     def generate(
@@ -304,7 +466,7 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
             captions (list): A list of strings of length batch_size * num_captions.
         """
         image = samples["image"]
-        # Extract visual features (with parallel spatial branch if enabled)
+        # Extract visual features for Q-Former (DO NOT apply spatial branch here)
         image_embeds = self._extract_visual_features(image, use_grad_for_vit=False)
 
         if not use_nucleus_sampling:
@@ -330,7 +492,7 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
         outputs = self.Qformer.generate(
             input_ids=input_ids,
             query_embeds=query_tokens,
-            max_length=max_length,  
+            max_length=max_length,
             min_length=min_length,
             num_beams=num_beams,
             do_sample=use_nucleus_sampling,
@@ -344,7 +506,7 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
 
     @torch.no_grad()
     def forward_image(self, image):
-        # Extract visual features (with parallel spatial branch if enabled)
+        # Extract visual features for Q-Former (DO NOT apply spatial branch here)
         image_embeds = self._extract_visual_features(image, use_grad_for_vit=False)
         
         image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(
@@ -451,10 +613,6 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
             image_embeds_frozen = self.ln_vision(vit_output)
         image_embeds_frozen = image_embeds_frozen.float()
         
-        # Apply parallel spatial branch if enabled
-        if self.use_spatial_adapter:
-            image_embeds_frozen = self._apply_spatial_branch(image_embeds_frozen)
-        
         image_atts = torch.ones(
             image_embeds_frozen.size()[:-1], dtype=torch.long
         ).to(self.device)
@@ -516,10 +674,6 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
                 image_embeds_frozen = self.ln_vision(vit_output)
             image_embeds_frozen = image_embeds_frozen.float()
             
-            # Apply parallel spatial branch if enabled
-            if self.use_spatial_adapter:
-                image_embeds_frozen = self._apply_spatial_branch(image_embeds_frozen)
-            
             image_atts = torch.ones(
                 image_embeds_frozen.size()[:-1], dtype=torch.long
             ).to(self.device)
@@ -561,10 +715,6 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
                 vit_output = self.visual_encoder(image)
                 image_embeds_frozen = self.ln_vision(vit_output)
             image_embeds_frozen = image_embeds_frozen.float()
-            
-            # Apply parallel spatial branch if enabled
-            if self.use_spatial_adapter:
-                image_embeds_frozen = self._apply_spatial_branch(image_embeds_frozen)
             
             image_atts = torch.ones(
                 image_embeds_frozen.size()[:-1], dtype=torch.long
@@ -619,6 +769,14 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
         spatial_adapter_hidden_dim = cfg.get("spatial_adapter_hidden_dim", 768)
         spatial_adapter_num_heads = cfg.get("spatial_adapter_num_heads", 12)
         spatial_adapter_depth = cfg.get("spatial_adapter_depth", 2)
+        
+        # GloFND configuration
+        use_glofnd = cfg.get("use_glofnd", False)
+        glofnd_data_size = cfg.get("glofnd_data_size", 50000)
+        glofnd_alpha = cfg.get("glofnd_alpha", 1e-3)
+        glofnd_lr_lda = cfg.get("glofnd_lr_lda", 0.05)
+        glofnd_start_update = cfg.get("glofnd_start_update", 15)
+        glofnd_lda_start = cfg.get("glofnd_lda_start", 15)
 
         model = cls(
             vit_model=vit_model,
@@ -635,6 +793,13 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
             spatial_adapter_hidden_dim=spatial_adapter_hidden_dim,
             spatial_adapter_num_heads=spatial_adapter_num_heads,
             spatial_adapter_depth=spatial_adapter_depth,
+            # GloFND
+            use_glofnd=use_glofnd,
+            glofnd_data_size=glofnd_data_size,
+            glofnd_alpha=glofnd_alpha,
+            glofnd_lr_lda=glofnd_lr_lda,
+            glofnd_start_update=glofnd_start_update,
+            glofnd_lda_start=glofnd_lda_start,
         )
         model.load_checkpoint_from_config(cfg)
 
@@ -658,3 +823,17 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
         if self.use_spatial_adapter:
             return self.spatial_adapter.get_gate_value()
         return None
+    
+    def set_glofnd_epoch(self, epoch: int):
+        """
+        Set the current epoch for GloFND loss modules.
+        This controls when lambda thresholds start updating and filtering.
+        
+        Args:
+            epoch: Current training epoch
+        """
+        if self.use_glofnd:
+            if self.glofnd_loss_itc is not None:
+                self.glofnd_loss_itc.set_epoch(epoch)
+            if self.glofnd_loss_rtc is not None:
+                self.glofnd_loss_rtc.set_epoch(epoch)

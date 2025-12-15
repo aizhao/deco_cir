@@ -1,0 +1,95 @@
+# 双流架构 CIR 模型 - 消融实验配置集合
+# 用于系统性地评估各模块的贡献
+
+# ====================================
+# 消融实验 1: Baseline (无新增模块)
+# 退化为标准 Q-Former CIR
+# ====================================
+ablation_baseline:
+  use_semantic_stream: False
+  use_fusion_module: False
+  use_instruction_expansion: False
+  fusion_type: "add"  # 不会使用
+
+# ====================================
+# 消融实验 2: 仅语义流 (无融合模块)
+# ====================================
+ablation_semantic_only:
+  use_semantic_stream: True
+  use_fusion_module: False
+  use_instruction_expansion: True
+  fusion_type: "add"  # 不会使用
+
+# ====================================
+# 消融实验 3: 语义流 + 简单融合 (add)
+# ====================================
+ablation_add_fusion:
+  use_semantic_stream: True
+  use_fusion_module: True
+  use_instruction_expansion: True
+  fusion_type: "add"
+
+# ====================================
+# 消融实验 4: 语义流 + 拼接融合 (concat)
+# ====================================
+ablation_concat_fusion:
+  use_semantic_stream: True
+  use_fusion_module: True
+  use_instruction_expansion: True
+  fusion_type: "concat"
+
+# ====================================
+# 消融实验 5: 语义流 + 门控融合 (gated)
+# ====================================
+ablation_gated_fusion:
+  use_semantic_stream: True
+  use_fusion_module: True
+  use_instruction_expansion: True
+  fusion_type: "gated"
+
+# ====================================
+# 消融实验 6: 语义流 + Cross-Attention 融合 (完整模型)
+# ====================================
+ablation_full:
+  use_semantic_stream: True
+  use_fusion_module: True
+  use_instruction_expansion: True
+  fusion_type: "cross_attention"
+
+# ====================================
+# 消融实验 7: 无指令展开
+# ====================================
+ablation_no_expansion:
+  use_semantic_stream: True
+  use_fusion_module: True
+  use_instruction_expansion: False
+  fusion_type: "cross_attention"
+
+# ====================================
+# 消融实验配置使用说明
+# ====================================
+# 
+# 在训练脚本中，可以通过覆盖配置来运行不同的消融实验:
+#
+# 例如，运行 baseline 消融:
+# python train.py --cfg configs/train/xxx.yaml \
+#     model.use_semantic_stream=False \
+#     model.use_fusion_module=False \
+#     model.use_instruction_expansion=False
+#
+# 或者，运行门控融合消融:
+# python train.py --cfg configs/train/xxx.yaml \
+#     model.fusion_type="gated"
+#
+# 建议的实验顺序:
+# 1. ablation_baseline      - 建立基准性能
+# 2. ablation_semantic_only - 验证语义流的价值
+# 3. ablation_add_fusion    - 最简单的融合方式
+# 4. ablation_concat_fusion - 中等复杂度融合
+# 5. ablation_gated_fusion  - 门控融合 (受 CAMS 启发)
+# 6. ablation_full          - 完整模型 (Cross-Attention)
+# 7. ablation_no_expansion  - 验证指令展开的价值
+
+
+
+

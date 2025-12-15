@@ -178,14 +178,66 @@ def clip_finetune_fiq(train_dress_types: List[str], val_dress_types: List[str],
     relative_train_loader = DataLoader(dataset=relative_train_dataset, batch_size=batch_size,
                                        num_workers=kwargs['num_workers'], pin_memory=False, collate_fn=collate_fn,
                                        drop_last=True, shuffle=True)
+    
+    # GloFND configuration
+    use_glofnd = kwargs.get('use_glofnd', False)
+    if use_glofnd:
+        glofnd_data_size = kwargs.get('glofnd_data_size', len(relative_train_dataset))
+        print(f"GloFND enabled: data_size={glofnd_data_size}")
+        # Update model config if needed (for from_config)
+        if config_overrides is None:
+            config_overrides = {}
+        config_overrides.update({
+            'use_glofnd': True,
+            'glofnd_data_size': glofnd_data_size,
+            'glofnd_alpha': kwargs.get('glofnd_alpha', 1e-3),
+            'glofnd_lr_lda': kwargs.get('glofnd_lr_lda', 0.05),
+            'glofnd_start_update': kwargs.get('glofnd_start_update', 15),
+            'glofnd_lda_start': kwargs.get('glofnd_lda_start', 15),
+        })
+        # Re-initialize model with GloFND if not already done
+        if not hasattr(blip_model, 'use_glofnd') or not blip_model.use_glofnd:
+            # Model needs to be recreated with GloFND config
+            from lavis.common.registry import registry
+            from omegaconf import OmegaConf
+            model_cls = registry.get_model_class(blip_model_name)
+            cfg = OmegaConf.load(model_cls.default_config_path(backbone))
+            for key, value in config_overrides.items():
+                if hasattr(cfg, 'model'):
+                    cfg.model[key] = value
+                else:
+                    cfg[key] = value
+            blip_model = model_cls.from_config(cfg.model)
+            blip_model = blip_model.to(device)
+            if not blip_model.training:
+                blip_model.train()
+            print("Model reinitialized with GloFND support")
+    else:
+        print("GloFND disabled (using standard InfoNCE loss)")
 
     # Define the optimizer, the loss and the grad scaler
-    optimizer = optim.AdamW(
-        [{'params': filter(lambda p: p.requires_grad, blip_model.parameters()), 'lr': learning_rate,
-        #   'betas': (0.9, 0.999), 'eps': 1e-7, 'weight_decay':0.05}])
-        'betas': (0.9, 0.98), 'eps': 1e-7, 'weight_decay':0.05}])
-    # scheduler = OneCycleLR(optimizer, max_lr=learning_rate, pct_start=1/50, steps_per_epoch=len(relative_train_loader), epochs=80)
-    scheduler = OneCycleLR(optimizer, max_lr=learning_rate, pct_start=1.5/num_epochs, div_factor=100., steps_per_epoch=len(relative_train_loader), epochs=num_epochs)
+    # 分离学习率：Spatial Adapter 使用更高的学习率
+    spatial_adapter_lr_mult = kwargs.get('spatial_adapter_lr_mult', 10.0)
+    
+    if hasattr(blip_model, 'spatial_adapter') and blip_model.use_spatial_adapter:
+        # 分离 Spatial Adapter 参数和其他参数
+        spatial_adapter_params = list(blip_model.spatial_adapter.parameters())
+        spatial_adapter_param_ids = set(id(p) for p in spatial_adapter_params)
+        other_params = [p for p in blip_model.parameters() if p.requires_grad and id(p) not in spatial_adapter_param_ids]
+        
+        optimizer = optim.AdamW([
+            {'params': other_params, 'lr': learning_rate, 'betas': (0.9, 0.98), 'eps': 1e-7, 'weight_decay': 0.05},
+            {'params': spatial_adapter_params, 'lr': learning_rate * spatial_adapter_lr_mult, 'betas': (0.9, 0.98), 'eps': 1e-7, 'weight_decay': 0.01}
+        ])
+        print(f"Using separate learning rates: base={learning_rate}, spatial_adapter={learning_rate * spatial_adapter_lr_mult}")
+        max_lrs = [learning_rate, learning_rate * spatial_adapter_lr_mult]
+    else:
+        optimizer = optim.AdamW(
+            [{'params': filter(lambda p: p.requires_grad, blip_model.parameters()), 'lr': learning_rate,
+              'betas': (0.9, 0.98), 'eps': 1e-7, 'weight_decay':0.05}])
+        max_lrs = learning_rate
+    
+    scheduler = OneCycleLR(optimizer, max_lr=max_lrs, pct_start=1.5/num_epochs, div_factor=100., steps_per_epoch=len(relative_train_loader), epochs=num_epochs)
 
     scaler = torch.cuda.amp.GradScaler()
 
@@ -200,16 +252,25 @@ def clip_finetune_fiq(train_dress_types: List[str], val_dress_types: List[str],
 
     # Start with the training loop
     print('Training loop started')
+    
+    # 梯度累积步数
+    accum_grad_iters = kwargs.get('accum_grad_iters', 1)
+    print(f"Using gradient accumulation with {accum_grad_iters} steps (effective batch size: {batch_size * accum_grad_iters})")
+    
     for epoch in range(num_epochs):
+        # Set GloFND epoch for lambda threshold updates
+        if use_glofnd and hasattr(blip_model, 'set_glofnd_epoch'):
+            blip_model.set_glofnd_epoch(epoch)
+        
         train_running_results = {'images_in_epoch': 0}
         train_bar = tqdm(relative_train_loader, ncols=150, leave=False, 
                          dynamic_ncols=True, position=0, 
                          desc=f"Epoch {epoch}/{num_epochs}")
+        optimizer.zero_grad()  # 在 epoch 开始时清零梯度
+        
         for idx, (reference_images, target_images, captions) in enumerate(train_bar):
             images_in_batch = reference_images.size(0)
             step = len(train_bar) * epoch + idx
-
-            optimizer.zero_grad()
 
             reference_images = reference_images.to(device, non_blocking=True)
             target_images = target_images.to(device, non_blocking=True)
@@ -219,18 +280,34 @@ def clip_finetune_fiq(train_dress_types: List[str], val_dress_types: List[str],
             captions = generate_randomized_fiq_caption(flattened_captions)
             captions = [txt_processors["eval"](caption) for caption in captions]
             blip_model.train()
+            
+            # Generate sample indices for GloFND (if enabled)
+            batch_indices = torch.arange(reference_images.size(0), device=device, dtype=torch.long)
+            
             # Extract the features, compute the logits and the loss
             with torch.cuda.amp.autocast():
-                loss_dict = blip_model({"image":reference_images, "target":target_images, "text_input":captions})
+                loss_dict = blip_model({
+                    "image": reference_images,
+                    "target": target_images,
+                    "text_input": captions,
+                    "indices": batch_indices,  # Pass indices for GloFND
+                })
                 loss = 0.
                 for key in loss_dict.keys():
                     loss += loss_dict[key]
+                # 梯度累积：将 loss 除以累积步数
+                loss = loss / accum_grad_iters
 
-            # Backpropagate and update the weights
+            # Backpropagate (累积梯度)
             scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            
+            # 每 accum_grad_iters 步更新一次权重
+            if (idx + 1) % accum_grad_iters == 0 or (idx + 1) == len(train_bar):
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
             scheduler.step()
+            
             update_train_running_results_dict(train_running_results, loss_dict, images_in_batch)
             set_train_bar_description_dict(train_bar, epoch, num_epochs, train_running_results)
 
@@ -238,7 +315,7 @@ def clip_finetune_fiq(train_dress_types: List[str], val_dress_types: List[str],
         for key in train_running_results.keys():
             if key != 'images_in_epoch':
                 loss_log_dict[key] = float(
-            train_running_results[key] / train_running_results['images_in_epoch'])
+                    train_running_results[key] / train_running_results['images_in_epoch'])
         
         # 监控 Spatial Adapter 门控值
         if hasattr(blip_model, 'get_spatial_adapter_gate_value'):
@@ -247,7 +324,20 @@ def clip_finetune_fiq(train_dress_types: List[str], val_dress_types: List[str],
                 loss_log_dict['spatial_gate'] = gate_value
                 print(f"[Epoch {epoch}] Spatial Adapter Gate Value: {gate_value:.6f}")
         
-        # Training CSV logging
+        # 监控 GloFND 统计信息
+        if use_glofnd:
+            glofnd_keys = ['glofnd_itc_lda_mean', 'glofnd_itc_filtered_ratio', 
+                          'glofnd_rtc_lda_mean', 'glofnd_rtc_filtered_ratio']
+            for key in glofnd_keys:
+                if key in train_running_results and train_running_results['images_in_epoch'] > 0:
+                    value = train_running_results[key] / train_running_results['images_in_epoch']
+                    loss_log_dict[key] = value
+                    if 'lda_mean' in key:
+                        print(f"[Epoch {epoch}] {key}: {value:.6f}")
+                    elif 'filtered_ratio' in key:
+                        print(f"[Epoch {epoch}] {key}: {value:.4f}")
+        
+            # Training CSV logging
         training_log_frame = pd.concat(
             [training_log_frame,
                 pd.DataFrame(data=loss_log_dict, index=[0])])
@@ -377,12 +467,68 @@ def clip_finetune_cirr(num_epochs: int, blip_model_name: str, backbone: str, lea
     relative_train_loader = DataLoader(dataset=relative_train_dataset, batch_size=batch_size,
                                        num_workers=kwargs['num_workers'], pin_memory=False, collate_fn=collate_fn,
                                        drop_last=True, shuffle=True)
+    
+    # GloFND configuration (same as FashionIQ)
+    use_glofnd = kwargs.get('use_glofnd', False)
+    if use_glofnd:
+        glofnd_data_size = kwargs.get('glofnd_data_size', len(relative_train_dataset))
+        print(f"GloFND enabled: data_size={glofnd_data_size}")
+        # Update model config if needed (for from_config)
+        if config_overrides is None:
+            config_overrides = {}
+        config_overrides.update({
+            'use_glofnd': True,
+            'glofnd_data_size': glofnd_data_size,
+            'glofnd_alpha': kwargs.get('glofnd_alpha', 1e-3),
+            'glofnd_lr_lda': kwargs.get('glofnd_lr_lda', 0.05),
+            'glofnd_start_update': kwargs.get('glofnd_start_update', 15),
+            'glofnd_lda_start': kwargs.get('glofnd_lda_start', 15),
+        })
+        # Re-initialize model with GloFND if not already done
+        if not hasattr(blip_model, 'use_glofnd') or not blip_model.use_glofnd:
+            from lavis.common.registry import registry
+            from omegaconf import OmegaConf
+            model_cls = registry.get_model_class(blip_model_name)
+            cfg = OmegaConf.load(model_cls.default_config_path(backbone))
+            for key, value in config_overrides.items():
+                if hasattr(cfg, 'model'):
+                    cfg.model[key] = value
+                else:
+                    cfg[key] = value
+            blip_model = model_cls.from_config(cfg.model)
+            blip_model = blip_model.to(device)
+            if not blip_model.training:
+                blip_model.train()
+            print("Model reinitialized with GloFND support")
+    else:
+        print("GloFND disabled (using standard InfoNCE loss)")
 
     # Define the optimizer, the loss and the grad scaler
-    optimizer = optim.AdamW(
-        [{'params': filter(lambda p: p.requires_grad, blip_model.parameters()), 'lr': learning_rate,
-          'betas': (0.9, 0.98), 'eps': 1e-7, 'weight_decay':0.05}])
-    scheduler = OneCycleLR(optimizer, max_lr=learning_rate, pct_start=1/50, steps_per_epoch=len(relative_train_loader), epochs=80)
+    # 分离学习率：Spatial Adapter 使用更高的学习率
+    spatial_adapter_lr_mult = kwargs.get('spatial_adapter_lr_mult', 10.0)
+    
+    if hasattr(blip_model, 'spatial_adapter') and blip_model.use_spatial_adapter:
+        # 分离 Spatial Adapter 参数和其他参数
+        spatial_adapter_params = list(blip_model.spatial_adapter.parameters())
+        spatial_adapter_param_ids = set(id(p) for p in spatial_adapter_params)
+        other_params = [p for p in blip_model.parameters() if p.requires_grad and id(p) not in spatial_adapter_param_ids]
+        
+        optimizer = optim.AdamW([
+            {'params': other_params, 'lr': learning_rate, 'betas': (0.9, 0.98), 'eps': 1e-7, 'weight_decay': 0.05},
+            {'params': spatial_adapter_params, 'lr': learning_rate * spatial_adapter_lr_mult, 'betas': (0.9, 0.98), 'eps': 1e-7, 'weight_decay': 0.01}
+        ])
+        print(f"Using separate learning rates: base={learning_rate}, spatial_adapter={learning_rate * spatial_adapter_lr_mult}")
+    else:
+        optimizer = optim.AdamW(
+            [{'params': filter(lambda p: p.requires_grad, blip_model.parameters()), 'lr': learning_rate,
+              'betas': (0.9, 0.98), 'eps': 1e-7, 'weight_decay':0.05}])
+    
+    # 计算 max_lr 用于 scheduler
+    if hasattr(blip_model, 'spatial_adapter') and blip_model.use_spatial_adapter:
+        max_lrs = [learning_rate, learning_rate * spatial_adapter_lr_mult]
+    else:
+        max_lrs = learning_rate
+    scheduler = OneCycleLR(optimizer, max_lr=max_lrs, pct_start=1/50, steps_per_epoch=len(relative_train_loader), epochs=num_epochs)
 
     scaler = torch.cuda.amp.GradScaler()
 
@@ -400,34 +546,59 @@ def clip_finetune_cirr(num_epochs: int, blip_model_name: str, backbone: str, lea
     # # 
     # results = compute_cirr_val_metrics(relative_val_dataset, blip_model, val_index_features,
     #                                     val_index_names, txt_processors)
+    # 梯度累积步数
+    accum_grad_iters = kwargs.get('accum_grad_iters', 1)
+    print(f"Using gradient accumulation with {accum_grad_iters} steps (effective batch size: {batch_size * accum_grad_iters})")
+    
     for epoch in range(num_epochs):
+        # Set GloFND epoch for lambda threshold updates
+        if use_glofnd and hasattr(blip_model, 'set_glofnd_epoch'):
+            blip_model.set_glofnd_epoch(epoch)
+        
         train_running_results = {'images_in_epoch': 0}
         train_bar = tqdm(relative_train_loader, ncols=150, leave=False, 
                          dynamic_ncols=True, position=0, 
                          desc=f"Epoch {epoch}/{num_epochs}")
+        optimizer.zero_grad()  # 在 epoch 开始时清零梯度
+        
         for idx, (reference_images, target_images, captions) in enumerate(train_bar):
-            # print(scheduler.optimizer.param_groups[0]['lr'])
             images_in_batch = reference_images.size(0)
             step = len(train_bar) * epoch + idx
-            optimizer.zero_grad()
 
             reference_images = reference_images.to(device, non_blocking=True)
             target_images = target_images.to(device, non_blocking=True)
             captions = [txt_processors["eval"](caption) for caption in captions]
             blip_model.train()
+            
+            # Generate sample indices for GloFND (if enabled)
+            batch_indices = torch.arange(reference_images.size(0), device=device, dtype=torch.long)
+            
             # Extract the features, compute the logits and the loss
             with torch.cuda.amp.autocast():
-                loss_dict = blip_model({"image":reference_images, "target":target_images, "text_input":captions})
+                loss_dict = blip_model({
+                    "image": reference_images,
+                    "target": target_images,
+                    "text_input": captions,
+                    "indices": batch_indices,  # Pass indices for GloFND
+                })
                 loss = 0.
                 for key in loss_dict.keys():
                     if key != 'loss_itc':
-                        loss += kwargs[key] * loss_dict[key]
+                        # 兼容新增 loss（若未提供权重，默认 1.0）
+                        loss += float(kwargs.get(key, 1.0)) * loss_dict[key]
                     else:
                         loss += loss_dict[key]
-            # Backpropagate and update the weights
+                # 梯度累积：将 loss 除以累积步数
+                loss = loss / accum_grad_iters
+            
+            # Backpropagate (累积梯度)
             scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            
+            # 每 accum_grad_iters 步更新一次权重
+            if (idx + 1) % accum_grad_iters == 0 or (idx + 1) == len(train_bar):
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
             scheduler.step()
 
             update_train_running_results_dict(train_running_results, loss_dict, images_in_batch)
@@ -438,7 +609,7 @@ def clip_finetune_cirr(num_epochs: int, blip_model_name: str, backbone: str, lea
         for key in train_running_results.keys():
             if key != 'images_in_epoch':
                 loss_log_dict[key] = float(
-            train_running_results[key] / train_running_results['images_in_epoch'])
+                    train_running_results[key] / train_running_results['images_in_epoch'])
         
         # 监控 Spatial Adapter 门控值
         if hasattr(blip_model, 'get_spatial_adapter_gate_value'):
@@ -447,7 +618,20 @@ def clip_finetune_cirr(num_epochs: int, blip_model_name: str, backbone: str, lea
                 loss_log_dict['spatial_gate'] = gate_value
                 print(f"[Epoch {epoch}] Spatial Adapter Gate Value: {gate_value:.6f}")
         
-        # Training CSV logging
+        # 监控 GloFND 统计信息
+        if use_glofnd:
+            glofnd_keys = ['glofnd_itc_lda_mean', 'glofnd_itc_filtered_ratio', 
+                          'glofnd_rtc_lda_mean', 'glofnd_rtc_filtered_ratio']
+            for key in glofnd_keys:
+                if key in train_running_results and train_running_results['images_in_epoch'] > 0:
+                    value = train_running_results[key] / train_running_results['images_in_epoch']
+                    loss_log_dict[key] = value
+                    if 'lda_mean' in key:
+                        print(f"[Epoch {epoch}] {key}: {value:.6f}")
+                    elif 'filtered_ratio' in key:
+                        print(f"[Epoch {epoch}] {key}: {value:.4f}")
+        
+            # Training CSV logging
         training_log_frame = pd.concat(
             [training_log_frame,
                 pd.DataFrame(data=loss_log_dict, index=[0])])
@@ -514,6 +698,10 @@ if __name__ == '__main__':
     parser.add_argument("--loss-align", default=0.4, type=float)
     parser.add_argument("--loss-rtc", default=0.4, type=float)
     parser.add_argument("--loss-itm", default=1, type=float)
+    parser.add_argument("--loss-spatial-itc", default=0.1, type=float,
+                        help="Spatial branch ITC loss weight (default 0.1)")
+    parser.add_argument("--loss-spatial-rtc", default=0.1, type=float,
+                        help="Spatial branch RTC loss weight (default 0.1)")
     parser.add_argument("--validation-frequency", default=1, type=int, help="Validation frequency expressed in epochs")
     parser.add_argument("--target-ratio", default=1.25, type=float, help="TargetPad target ratio")
     parser.add_argument("--transform", default="targetpad", type=str,
@@ -565,6 +753,31 @@ if __name__ == '__main__':
                         help="Spatial Adapter注意力头数 (默认12)")
     parser.add_argument("--spatial-adapter-depth", type=int, default=None,
                         help="Spatial Adapter Transformer层数 (默认2)")
+    parser.add_argument("--spatial-adapter-lr-mult", type=float, default=10.0,
+                        help="Spatial Adapter 学习率倍数 (默认10，即10倍于基础学习率)")
+    
+    # ====================================
+    # GloFND 配置参数
+    # ====================================
+    parser.add_argument("--use-glofnd", type=str, default=None,
+                        choices=['true', 'false'],
+                        help="是否启用 GloFND (Global False Negative Detection)")
+    parser.add_argument("--glofnd-data-size", type=int, default=None,
+                        help="GloFND 数据集大小 (默认自动从训练集获取)")
+    parser.add_argument("--glofnd-alpha", type=float, default=1e-3,
+                        help="GloFND alpha 参数 (假阴性检测敏感度，默认1e-3)")
+    parser.add_argument("--glofnd-lr-lda", type=float, default=0.05,
+                        help="GloFND lambda 阈值学习率 (默认0.05)")
+    parser.add_argument("--glofnd-start-update", type=int, default=15,
+                        help="GloFND 开始更新 lambda 阈值的 epoch (默认15)")
+    parser.add_argument("--glofnd-lda-start", type=int, default=15,
+                        help="GloFND 开始过滤假阴性的 epoch (默认15)")
+    
+    # ====================================
+    # 梯度累积配置
+    # ====================================
+    parser.add_argument("--accum-grad-iters", type=int, default=1,
+                        help="梯度累积步数 (默认1，即不累积)")
 
     args = parser.parse_args()
     if args.dataset.lower() not in ['fashioniq', 'cirr']:
@@ -599,6 +812,21 @@ if __name__ == '__main__':
     if args.spatial_adapter_depth is not None:
         config_overrides['spatial_adapter_depth'] = args.spatial_adapter_depth
     
+    # GloFND 配置
+    glofnd_kwargs = {}
+    if args.use_glofnd is not None:
+        glofnd_kwargs['use_glofnd'] = args.use_glofnd.lower() == 'true'
+    if args.glofnd_data_size is not None:
+        glofnd_kwargs['glofnd_data_size'] = args.glofnd_data_size
+    if args.glofnd_alpha is not None:
+        glofnd_kwargs['glofnd_alpha'] = args.glofnd_alpha
+    if args.glofnd_lr_lda is not None:
+        glofnd_kwargs['glofnd_lr_lda'] = args.glofnd_lr_lda
+    if args.glofnd_start_update is not None:
+        glofnd_kwargs['glofnd_start_update'] = args.glofnd_start_update
+    if args.glofnd_lda_start is not None:
+        glofnd_kwargs['glofnd_lda_start'] = args.glofnd_lda_start
+    
     # 如果没有任何覆盖，设为 None
     if not config_overrides:
         config_overrides = None
@@ -608,6 +836,7 @@ if __name__ == '__main__':
             print(f"  {key}: {value}")
     
     print(f"save-memory: {args.save_memory}")
+    print(f"accum-grad-iters: {args.accum_grad_iters}")
     training_hyper_params = {
         "num_epochs": args.num_epochs,
         "num_workers": args.num_workers,
@@ -624,9 +853,15 @@ if __name__ == '__main__':
         "loss_rtc": args.loss_rtc,
         "loss_align": args.loss_align,
         "loss_itm": args.loss_itm,
+        "loss_spatial_itc": args.loss_spatial_itc,
+        "loss_spatial_rtc": args.loss_spatial_rtc,
         "save_memory": args.save_memory,
         "config_overrides": config_overrides,  # 添加配置覆盖
+        "accum_grad_iters": args.accum_grad_iters,  # 梯度累积步数
+        "spatial_adapter_lr_mult": args.spatial_adapter_lr_mult,  # Spatial Adapter 学习率倍数
     }
+    # 添加 GloFND 参数
+    training_hyper_params.update(glofnd_kwargs)
     # set_seed(912)
     if args.dataset.lower() == 'cirr':
         clip_finetune_cirr(**training_hyper_params)

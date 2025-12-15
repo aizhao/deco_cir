@@ -183,27 +183,40 @@ def update_train_running_results_dict(train_running_results: dict, loss_dict: di
     for key in loss_dict.keys():
         if key not in train_running_results:
             train_running_results[key] = 0
-        train_running_results[key] += loss_dict[key].to('cpu', non_blocking=True).detach().item() * images_in_batch
+        val = loss_dict[key]
+        if isinstance(val, torch.Tensor):
+            val_item = val.to('cpu', non_blocking=True).detach().item()
+        else:
+            val_item = float(val)
+        train_running_results[key] += val_item * images_in_batch
 
     train_running_results["images_in_epoch"] += images_in_batch
 
 def set_train_bar_description_dict(train_bar, epoch: int, num_epochs: int, train_running_results: dict):
     """
-    Update tqdm train bar during training
-    :param train_bar: tqdm training bar
-    :param epoch: current epoch
-    :param num_epochs: numbers of epochs
-    :param train_running_results: logging training dict
-    """ 
-    images_in_epoch = train_running_results['images_in_epoch']
-    bar_content = ''
-    for key in train_running_results:
-        if key != 'images_in_epoch':
-            bar_content += f'{key}: {train_running_results[key] / images_in_epoch:.3f}, '
-    train_bar.set_description(
-        desc=f"[{epoch}/{num_epochs}] "
-             f"{bar_content}"
-    )   
+    Update tqdm train bar during training with a compact display.
+    """
+    images_in_epoch = train_running_results.get('images_in_epoch', 0)
+    if images_in_epoch == 0:
+        return
+
+    display_keys = [
+        "loss_itc",
+        "loss_rtc",
+        "loss_align",
+        "loss_spatial_itc",
+        "loss_spatial_rtc",
+        "glofnd_itc_lda_mean",
+        "glofnd_rtc_lda_mean",
+    ]
+    parts = []
+    for k in display_keys:
+        if k in train_running_results:
+            val = train_running_results[k] / images_in_epoch
+            parts.append(f"{k}:{val:.3f}")
+
+    bar_content = " ".join(parts)
+    train_bar.set_description(desc=f"[{epoch}/{num_epochs}] {bar_content}")  
 
 def save_model(name: str, cur_epoch: int, model_to_save: nn.Module, training_path: Path):
     """

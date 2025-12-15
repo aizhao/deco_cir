@@ -1,0 +1,108 @@
+# Copyright (c) 2023, salesforce.com, inc.
+# All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
+# For full license text, see the LICENSE file in the repo root or https://opensource.org/licenses/BSD-3-Clause
+
+# 双流架构 CIR 模型配置
+# 消融实验: 通过开关控制各模块
+
+model:
+  arch: blip2_dual_stream_cir
+  load_finetuned: False
+  
+  # 预训练权重
+  pretrained: "https://storage.googleapis.com/sfr-vision-language-research/LAVIS/models/BLIP2/blip2_pretrained.pth"
+  finetuned: ""
+  
+  # ViT 编码器配置
+  vit_model: "eva_clip_g"
+  image_size: 224
+  drop_path_rate: 0
+  use_grad_checkpoint: False
+  vit_precision: "fp16"
+  freeze_vit: True
+  
+  # Q-Former 配置
+  num_query_token: 32
+  cross_attention_freq: 2
+  
+  # 输出配置
+  embed_dim: 256
+  max_txt_len: 32
+  
+  # ====================================
+  # 消融实验开关 (Ablation Switches)
+  # ====================================
+  # 完整模型: 所有开关都为 True
+  # Baseline (Q-Former only): 所有开关都为 False
+  
+  # 是否使用语义理解流
+  use_semantic_stream: True
+  
+  # 是否使用语义引导融合模块
+  use_fusion_module: True
+  
+  # 是否使用指令展开 (仅轻量级模式有效)
+  use_instruction_expansion: True
+  
+  # 融合类型: 'cross_attention', 'gated', 'concat', 'add'
+  fusion_type: "cross_attention"
+  
+  # ====================================
+  # 语义流参数
+  # ====================================
+  # 语义模型类型: 'lightweight', 'blip2', 'blip2_gen', 'qwen2_vl'
+  # - lightweight: 使用简单 BERT + InstructionExpansion，参数量最小
+  # - blip2: 使用 BLIP2 风格的语义模块，平衡性能和效率
+  # - blip2_gen (推荐): 使用 T5 生成展开文本，语义理解更强
+  # - qwen2_vl: 使用 Qwen2.5-VL，最强但需要更多显存
+  semantic_model_type: "blip2_gen"
+  
+  # T5 模型选择 (仅 semantic_model_type=blip2_gen 时有效)
+  # 可选: 'flan-t5-small' (80M), 'flan-t5-base' (250M, 推荐), 'flan-t5-large' (780M)
+  t5_model_name: "flan-t5-base"
+  
+  # Qwen2-VL 模型选择 (仅 semantic_model_type=qwen2_vl 时有效)
+  # 可选: 'qwen2-vl-2b', 'qwen2-vl-7b', 'qwen2.5-vl-3b', 'qwen2.5-vl-7b'
+  qwen_model_name: "qwen2.5-vl-3b"
+  
+  # 是否冻结 VLM/T5 参数 (建议 True)
+  freeze_vlm: True
+  
+  # VLM 是否使用图像输入 (仅 qwen2_vl 模式)
+  use_vlm_image_input: True
+  
+  # BLIP2 语义模块是否使用图像引导 (仅 blip2 模式)
+  use_image_in_semantic: True
+  
+  semantic_hidden_dim: 768
+  num_expansion_tokens: 8
+  
+  # ====================================
+  # 融合模块参数
+  # ====================================
+  num_fusion_layers: 2
+  fusion_heads: 8
+  fusion_dropout: 0.1
+  
+  # ====================================
+  # 查询生成参数
+  # ====================================
+  # 聚合方式: 'attention', 'mean', 'first', 'all'
+  query_aggregation: "attention"
+
+
+preprocess:
+  vis_processor:
+    train:
+      name: "blip_image_train"
+      image_size: 224
+    eval:
+      name: "blip_image_eval"
+      image_size: 224
+  text_processor:
+    train:
+      name: "blip_caption"
+    eval:
+      name: "blip_caption"
+

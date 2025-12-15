@@ -250,10 +250,11 @@ class QwenSpatialAdapter(nn.Module):
         # 4. Up projection back to original feature space
         self.up_project = nn.Linear(hidden_dim, input_dim)
         
-        # 5. Zero-init gate
-        # Ensures that at training start, this branch outputs 0,
-        # not disturbing the original SPRC performance
-        self.gate = nn.Parameter(torch.zeros(1))
+        # 5. Small-init gate
+        # 使用很小的初始值，确保：
+        # - 梯度可以正常流动 (非零)
+        # - 初始时几乎不干扰原始SPRC性能 (接近0)
+        self.gate = nn.Parameter(torch.tensor([0.001]))
         
         # Store config for reference
         self.input_dim = input_dim
@@ -261,9 +262,14 @@ class QwenSpatialAdapter(nn.Module):
         self.num_heads = num_heads
         self.depth = depth
         
-        # Initialize up_project to zero for stable training
-        nn.init.zeros_(self.up_project.weight)
+        # Initialize up_project with small values for stable training
+        # 使用较小的标准差，确保初始输出小
+        nn.init.normal_(self.up_project.weight, std=0.02)
         nn.init.zeros_(self.up_project.bias)
+        
+        # Initialize down_project normally
+        nn.init.normal_(self.down_project.weight, std=0.02)
+        nn.init.zeros_(self.down_project.bias)
     
     def forward(self, patch_tokens, grid_size=None):
         """

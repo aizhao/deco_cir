@@ -50,6 +50,7 @@ from lavis.models.blip2_models.blip2_qformer_cir_neg_rel import Blip2QformerCirN
 from lavis.models.blip2_models.blip2_qformer_cir_rerank import Blip2QformerCirRerank
 from lavis.models.blip2_models.blip2_qformer_cir_z_learn_pos_align import Blip2QformerCirZLearnPosAlign
 from lavis.models.blip2_models.blip2_instruct_cir import Blip2InstructCir
+from lavis.models.blip2_models.blip2_dual_stream_cir import Blip2DualStreamCIR
 
 from lavis.models.blip2_models.blip2_t5_instruct import Blip2T5Instruct
 from lavis.models.blip2_models.blip2_vicuna_instruct import Blip2VicunaInstruct
@@ -105,6 +106,7 @@ __all__ = [
     "Blip2T5Instruct",
     "Blip2VicunaInstruct",
     "Blip2InstructCir",
+    "Blip2DualStreamCIR",
     "PNPVQA",
     "Img2PromptVQA",
     "PNPUnifiedQAv2FiD",

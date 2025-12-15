@@ -1,0 +1,117 @@
+# 双流架构 CIR 模型训练配置 - CIRR 数据集
+# 
+# 使用方法:
+#   完整模型: python train.py --cfg configs/projects/blip2_dual_stream_cir/train_cirr.yaml
+#   
+#   消融实验 - Baseline:
+#   python train.py --cfg configs/projects/blip2_dual_stream_cir/train_cirr.yaml \
+#       model.use_semantic_stream=False model.use_fusion_module=False
+#   
+#   消融实验 - 门控融合:
+#   python train.py --cfg configs/projects/blip2_dual_stream_cir/train_cirr.yaml \
+#       model.fusion_type=gated
+
+model:
+  arch: blip2_dual_stream_cir
+  
+  # 基础模型配置
+  vit_model: "eva_clip_g"
+  image_size: 224
+  drop_path_rate: 0
+  use_grad_checkpoint: False
+  vit_precision: "fp16"
+  freeze_vit: True
+  
+  # Q-Former 配置
+  num_query_token: 32
+  cross_attention_freq: 2
+  
+  # 预训练权重
+  pretrained: "https://storage.googleapis.com/sfr-vision-language-research/LAVIS/models/BLIP2/blip2_pretrained.pth"
+  
+  # 输出配置
+  embed_dim: 256
+  max_txt_len: 32
+  
+  # ====================================
+  # 双流架构配置 (消融实验开关)
+  # ====================================
+  use_semantic_stream: True
+  use_fusion_module: True
+  use_instruction_expansion: True
+  fusion_type: "cross_attention"
+  
+  # 语义流参数
+  semantic_hidden_dim: 768
+  num_expansion_tokens: 8
+  
+  # 融合模块参数
+  num_fusion_layers: 2
+  fusion_heads: 8
+  fusion_dropout: 0.1
+  
+  # 查询生成参数
+  query_aggregation: "attention"
+
+
+datasets:
+  cirr:
+    vis_processor:
+      train:
+        name: "blip_image_train"
+        image_size: 224
+      eval:
+        name: "blip_image_eval"
+        image_size: 224
+    text_processor:
+      train:
+        name: "blip_caption"
+      eval:
+        name: "blip_caption"
+
+
+run:
+  task: cir
+  
+  # 优化器配置
+  lr_sched: "linear_warmup_cosine_lr"
+  init_lr: 1e-5
+  min_lr: 1e-6
+  warmup_lr: 1e-6
+  warmup_steps: 1000
+  weight_decay: 0.05
+  max_epoch: 10
+  
+  # 批次大小
+  batch_size_train: 32
+  batch_size_eval: 64
+  num_workers: 4
+  
+  # 分布式训练
+  accum_grad_iters: 1
+  
+  # 混合精度
+  amp: True
+  
+  # 评估配置
+  evaluate: False
+  valid_splits: ["val"]
+  
+  # 保存配置
+  output_dir: "output/blip2_dual_stream_cir/cirr"
+  
+  # 日志
+  log_freq: 50
+  
+  # 设备
+  device: "cuda"
+  world_size: 1
+  dist_url: "env://"
+  distributed: True
+  
+  # 种子
+  seed: 42
+
+
+
+
