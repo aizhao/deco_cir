@@ -5,7 +5,7 @@ from datetime import datetime
 from pathlib import Path
 from statistics import mean, geometric_mean, harmonic_mean
 from typing import List
-import clip
+# import clip
 import numpy as np
 import pandas as pd
 import torch
